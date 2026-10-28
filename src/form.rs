@@ -19,7 +19,8 @@ pub enum Form {
     /// Keyword without the leading colon (`"k0"`, `"a/b"`).
     Keyword(String),
     Symbol(String),
-    /// Regex pattern source (`#"..."` contents, escapes interpreted).
+    /// Regex pattern source (`#"..."` contents, escapes verbatim: a
+    /// backslash always pairs with the next char, nothing is interpreted).
     Regex(String),
     List(Vec<Form>),
     Vector(Vec<Form>),
@@ -173,6 +174,27 @@ fn escape_into(out: &mut String, s: &str) {
     }
 }
 
+/// Print regex content. Clojure reads regex bodies verbatim — a
+/// backslash pairs with the next char and nothing is interpreted —
+/// so content goes out raw inside `#"..."`. Two shapes are
+/// unrepresentable there, and Clojure's own printer mangles them
+/// (print/read inconsistency): a `"` (emitted `\"` re-reads as the two
+/// chars `\"`) and a trailing `\` (it pairs with the closing quote).
+/// Those fall back to `(re-pattern "...")` with string escaping, which
+/// always preserves the pattern. The generator's patterns never hit
+/// the fallback; it exists for hand-built `Regex` forms.
+fn print_regex_into(out: &mut String, r: &str) {
+    if !r.contains('"') && !r.ends_with('\\') {
+        out.push_str("#\"");
+        out.push_str(r);
+        out.push('"');
+    } else {
+        out.push_str("(re-pattern \"");
+        escape_into(out, r);
+        out.push_str("\")");
+    }
+}
+
 fn print_atom(f: &Form, out: &mut String) {
     match f {
         Form::Nil => out.push_str("nil"),
@@ -200,11 +222,7 @@ fn print_atom(f: &Form, out: &mut String) {
             out.push_str(k);
         }
         Form::Symbol(s) => out.push_str(s),
-        Form::Regex(r) => {
-            out.push_str("#\"");
-            escape_into(out, r);
-            out.push('"');
-        }
+        Form::Regex(r) => print_regex_into(out, r),
         _ => unreachable!("not an atom"),
     }
 }
@@ -442,9 +460,19 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// Maximum nesting depth accepted by the parser. The reader, `size`,
+/// the printers, and the reducer's path walkers all recurse per level,
+/// so uncapped depth aborts the process with a stack overflow (observed:
+/// 5k survives, 10k aborts on the main thread). 512 keeps every
+/// recursion comfortable even on 2MB spawned-thread stacks; legitimate
+/// inputs (and generated programs, capped at depth 128) never come
+/// close.
+const MAX_DEPTH: usize = 512;
+
 struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -452,6 +480,7 @@ impl<'a> Parser<'a> {
         Self {
             bytes: input.as_bytes(),
             pos: 0,
+            depth: 0,
         }
     }
 
@@ -494,6 +523,12 @@ impl<'a> Parser<'a> {
                         return self.err("expected a form after #_");
                     }
                     self.read_form()?;
+                }
+                Some(b'#') if self.bytes.get(self.pos + 1) == Some(&b'!') => {
+                    // #! line comment (shebang), like Clojure.
+                    while !matches!(self.peek(), None | Some(b'\n')) {
+                        self.pos += 1;
+                    }
                 }
                 _ => return Ok(()),
             }
@@ -546,7 +581,13 @@ impl<'a> Parser<'a> {
                         })?;
                         let c = char::from_u32(code).ok_or_else(|| ParseError {
                             offset: self.pos,
-                            message: "invalid unicode escape".to_string(),
+                            // Lone surrogates are representable in
+                            // Clojure (UTF-16) but not in Rust (UTF-8).
+                            message: if (0xD800..0xE000).contains(&code) {
+                                "surrogate unicode escapes are not supported".to_string()
+                            } else {
+                                "invalid unicode escape".to_string()
+                            },
                         })?;
                         out.push(c);
                         self.pos += 4;
@@ -555,16 +596,9 @@ impl<'a> Parser<'a> {
                         return self.err(format!("unsupported escape: \\{}", other as char));
                     }
                 },
-                Some(_) => {
+                Some(b) => {
                     // Raw bytes (possibly multi-byte UTF-8); decode one char.
-                    let rest = &self.bytes[self.pos - 1..];
-                    let s = std::str::from_utf8(rest).map_err(|_| ParseError {
-                        offset: self.pos - 1,
-                        message: "invalid UTF-8".to_string(),
-                    })?;
-                    let c = s.chars().next().unwrap();
-                    out.push(c);
-                    self.pos += c.len_utf8() - 1;
+                    out.push(self.decode_char(b)?);
                 }
             }
         }
@@ -608,9 +642,35 @@ impl<'a> Parser<'a> {
         String::from_utf8_lossy(&self.bytes[start..self.pos]).into_owned()
     }
 
+    /// Decode the char starting at the already-consumed byte `first`
+    /// (which sits at `pos - 1`), advancing past its remaining bytes.
+    /// Casting the byte with `as char` would mangle multi-byte leaders.
+    fn decode_char(&mut self, first: u8) -> Result<char, ParseError> {
+        if first < 0x80 {
+            return Ok(first as char);
+        }
+        let rest = &self.bytes[self.pos - 1..];
+        let s = std::str::from_utf8(rest).map_err(|_| ParseError {
+            offset: self.pos - 1,
+            message: "invalid UTF-8".to_string(),
+        })?;
+        let c = s.chars().next().unwrap();
+        self.pos += c.len_utf8() - 1;
+        Ok(c)
+    }
+
     fn read_char(&mut self) -> Result<Form, ParseError> {
         // Backslash already consumed.
         let token = self.read_token();
+        if token.is_empty() {
+            // A delimiter char literal: \( \) \[ … — the very char the
+            // printer emits. (Delimiters are ASCII, so one byte is one
+            // char here; multi-byte chars land in the token above.)
+            return match self.bump() {
+                Some(b) => Ok(Form::Char(b as char)),
+                None => self.err("unterminated char literal"),
+            };
+        }
         let c = match token.as_str() {
             "newline" => '\n',
             "space" => ' ',
@@ -637,10 +697,31 @@ impl<'a> Parser<'a> {
         Ok(Form::Char(c))
     }
 
+    /// Read a regex body (opening `#"` consumed). Like Clojure, a
+    /// backslash escapes the next char verbatim — both bytes are kept —
+    /// so `#"\d"` is the two-char pattern `\d`, not `d`.
+    fn read_regex(&mut self) -> Result<String, ParseError> {
+        let mut out = String::new();
+        loop {
+            match self.bump() {
+                None => return self.err("unterminated regex"),
+                Some(b'"') => return Ok(out),
+                Some(b'\\') => match self.bump() {
+                    None => return self.err("unterminated regex escape"),
+                    Some(b) => {
+                        out.push('\\');
+                        out.push(self.decode_char(b)?);
+                    }
+                },
+                Some(b) => out.push(self.decode_char(b)?),
+            }
+        }
+    }
+
     fn read_dispatch(&mut self) -> Result<Form, ParseError> {
         // `#` already consumed.
         match self.bump() {
-            Some(b'"') => Ok(Form::Regex(self.read_string()?)),
+            Some(b'"') => Ok(Form::Regex(self.read_regex()?)),
             Some(b'{') => Ok(Form::Set(self.read_forms_until(b'}', "set")?)),
             Some(b'#') => {
                 let mut token = String::from("##");
@@ -668,7 +749,7 @@ impl<'a> Parser<'a> {
     }
 
     fn read_number_or_symbol(&mut self, first: u8) -> Result<Form, ParseError> {
-        let mut token = String::from(first as char);
+        let mut token = self.decode_char(first)?.to_string();
         token.push_str(&self.read_token());
         match token.as_str() {
             "nil" => return Ok(Form::Nil),
@@ -738,6 +819,17 @@ impl<'a> Parser<'a> {
     }
 
     fn read_form(&mut self) -> Result<Form, ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            self.depth -= 1;
+            return self.err("nesting too deep");
+        }
+        let r = self.read_form_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn read_form_inner(&mut self) -> Result<Form, ParseError> {
         self.skip_trivia()?;
         let b = match self.bump() {
             Some(b) => b,
@@ -985,5 +1077,100 @@ mod tests {
         // Binding positions count too (conservative for growth guards).
         let b = parse_one("(loop [i 0 acc 0] acc)").unwrap();
         assert_eq!(b.count_sym("acc"), 2);
+    }
+
+    #[test]
+    fn deep_nesting_is_rejected_not_fatal() {
+        let deep = "(".repeat(3000) + &")".repeat(3000);
+        let err = parse_one(&deep).expect_err("3000-deep input must be rejected");
+        assert!(err.message.contains("too deep"), "{err:?}");
+        let ok = "(".repeat(100) + &")".repeat(100);
+        assert!(parse_one(&ok).is_ok());
+    }
+
+    #[test]
+    fn non_ascii_symbols_survive() {
+        assert_eq!(parse_one("élan").unwrap(), Form::Symbol("élan".to_string()));
+        assert_eq!(parse_one("λ").unwrap(), Form::Symbol("λ".to_string()));
+    }
+
+    #[test]
+    fn char_delimiters_roundtrip() {
+        for (src, c) in [
+            ("\\(", '('),
+            ("\\)", ')'),
+            ("\\[", '['),
+            ("\\]", ']'),
+            ("\\{", '{'),
+            ("\\}", '}'),
+            ("\\\"", '"'),
+            ("\\é", 'é'),
+            ("\\a", 'a'),
+        ] {
+            assert_eq!(parse_one(src).unwrap(), Form::Char(c), "{src}");
+            assert_eq!(print_compact(&Form::Char(c)), src, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn regex_keeps_verbatim_escapes() {
+        // Like Clojure: backslash escapes the next char verbatim.
+        assert_eq!(
+            parse_one(r#"#"\d+\s""#).unwrap(),
+            Form::Regex(r"\d+\s".to_string())
+        );
+        assert_eq!(
+            parse_one(r#"#"a\"b""#).unwrap(),
+            Form::Regex("a\\\"b".to_string())
+        );
+    }
+
+    #[test]
+    fn regex_prints_verbatim_and_roundtrips() {
+        // The printer must not string-escape regex bodies: `\d` goes out
+        // as `\d`, or real Clojure would compile a different pattern.
+        for content in [r"\d", r"\d+\s", "plain", "with\nnewline"] {
+            let printed = print_compact(&Form::Regex(content.to_string()));
+            let parsed =
+                parse_one(&printed).unwrap_or_else(|e| panic!("{content:?} -> {printed:?}: {e}"));
+            assert_eq!(
+                parsed,
+                Form::Regex(content.to_string()),
+                "{printed:?} changed meaning"
+            );
+        }
+        assert_eq!(print_compact(&Form::Regex(r"\d".to_string())), r#"#"\d""#);
+        // A `"` or trailing `\` is unrepresentable in `#"..."` (Clojure's
+        // own printer mangles it): fall back to `(re-pattern "...")`,
+        // which re-reads to the identical pattern string.
+        for content in ["a\"b", r#"a\"b"#, "\"", "trailing\\", "\\"] {
+            let printed = print_compact(&Form::Regex(content.to_string()));
+            let parsed =
+                parse_one(&printed).unwrap_or_else(|e| panic!("{content:?} -> {printed:?}: {e}"));
+            match &parsed {
+                Form::List(fs)
+                    if fs.len() == 2 && fs[0] == Form::Symbol("re-pattern".to_string()) =>
+                {
+                    assert_eq!(
+                        fs[1],
+                        Form::Str(content.to_string()),
+                        "{printed:?} changed meaning"
+                    );
+                }
+                other => panic!("{content:?} -> {printed:?} -> {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn shebang_is_a_comment() {
+        let forms = parse_all("#!/usr/bin/env clojure\n(+ 1 2)\n").unwrap();
+        assert_eq!(forms.len(), 1);
+    }
+
+    #[test]
+    fn surrogate_escape_names_the_problem() {
+        let err = parse_one(r#""\ud800""#).expect_err("lone surrogate must fail");
+        assert!(err.message.contains("surrogate"), "{err:?}");
     }
 }

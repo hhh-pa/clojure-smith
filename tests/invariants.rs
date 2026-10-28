@@ -6,8 +6,10 @@
 //! called function. Violating it makes `swap!` retry forever, because every
 //! attempt changes the atom and fails the compare-and-swap.
 
-use clojure_smith::cost::{WORK_BUDGET_PER_FUNC, acc_growth_cap};
-use clojure_smith::form::{Form, parse_all};
+use clojure_smith::cost::{
+    NESTED_LOOP_TRIPS, WORK_BUDGET_PER_FUNC, acc_growth_cap, linear_growth_cap,
+};
+use clojure_smith::form::{Form, parse_all, print_compact};
 use clojure_smith::gen_expr::{MAX_CALL_LOOP_TRIPS, MAX_SELF_SITES};
 use clojure_smith::gen_program::{emit_program, gen_program};
 use clojure_smith::options::parse_generator_args;
@@ -1076,6 +1078,8 @@ fn loop_acc_growth_is_bounded() {
         vec!["--max-loop-iters", "100000"],
     ];
     let mut checked = 0;
+    let mut checked_linear = 0;
+    let mut checked_nested = 0;
     for args in &opt_sets {
         let opts = parse_generator_args(args.clone()).unwrap();
         for seed in 0..150 {
@@ -1136,6 +1140,27 @@ fn loop_acc_growth_is_bounded() {
                                 "{args:?} seed {seed} {name}: growable acc x{refs} with {n} trips (cap {cap})"
                             );
                         }
+                        // Linear growth: trips * update bytes fits the
+                        // budget. The generator caps against the live
+                        // remainder; the full budget is the sound static
+                        // over-approximation.
+                        if growable && refs == 1 {
+                            checked_linear += 1;
+                            let bytes = print_compact(update).len() as u64;
+                            let cap = linear_growth_cap(bytes, WORK_BUDGET_PER_FUNC);
+                            assert!(
+                                *n <= cap,
+                                "{args:?} seed {seed} {name}: linear acc +{bytes}B x{refs} with {n} trips (cap {cap})"
+                            );
+                        }
+                        // Nested loops multiply production opaquely.
+                        if growable && has_nested_loop(update) {
+                            checked_nested += 1;
+                            assert!(
+                                *n <= NESTED_LOOP_TRIPS,
+                                "{args:?} seed {seed} {name}: nested loop with {n} trips (cap {NESTED_LOOP_TRIPS})"
+                            );
+                        }
                     }
                     stack.extend(f.children());
                 }
@@ -1143,6 +1168,21 @@ fn loop_acc_growth_is_bounded() {
         }
     }
     assert!(checked > 0, "no multi-ref growable loops observed");
+    assert!(checked_linear > 0, "no linear growable loops observed");
+    assert!(checked_nested > 0, "no nested growable loops observed");
+}
+
+/// True when `form` contains a loop form of any kind (mirrors the
+/// generator's nesting guard).
+fn has_nested_loop(form: &Form) -> bool {
+    let mut stack = vec![form];
+    while let Some(f) = stack.pop() {
+        if matches!(f.head_symbol(), Some("loop" | "for" | "dotimes" | "doseq")) {
+            return true;
+        }
+        stack.extend(f.children());
+    }
+    false
 }
 
 /// Every `(range n)` is shrunk to fit the remaining budget and charged
@@ -1263,6 +1303,59 @@ fn emitted_programs_reparse_exactly() {
     }
 }
 
+/// No function may exceed Clojure's 20-parameter limit, even at
+/// `--max-params 20`: recursive functions take a fuel parameter in
+/// addition to the drawn ones, so the draw must reserve that slot.
+/// (JVM Clojure rejects 21-param `defn` with "Can't specify more than
+/// 20 params".)
+#[test]
+fn arities_respect_param_limit() {
+    let args = vec!["--max-params", "20", "--max-funcs", "8"];
+    let opts = parse_generator_args(args).unwrap();
+    for seed in 0..100 {
+        let prog = gen_program(&opts, seed);
+        for f in &prog.forms {
+            if let Form::List(fs) = f
+                && fs.len() >= 4
+                && sym(&fs[0]) == Some("defn")
+                && let Form::Vector(params) = &fs[2]
+            {
+                assert!(
+                    params.len() <= 20,
+                    "seed {seed}: {} has {} params",
+                    sym(&fs[1]).unwrap_or("?"),
+                    params.len()
+                );
+            }
+        }
+    }
+}
+
+/// Hostile maxima set directly (bypassing `validate()`, as library
+/// users can) must still generate a bounded program quickly: the budget
+/// hard-stops straight-line code, draws clamp to ceilings, and literals
+/// fit the remaining budget. Pre-fix, block-size 500 took 43s for 61MB.
+#[test]
+fn hostile_library_maxima_stay_bounded() {
+    let mut opts = parse_generator_args::<Vec<String>, String>(Vec::new()).unwrap();
+    opts.max_block_size = 20000;
+    opts.max_funcs = 2;
+    opts.max_expr_depth = 1000000;
+    opts.max_globals = 100000;
+    let prog = gen_program(&opts, 1);
+    let text = emit_program(&prog, &opts);
+    assert!(
+        text.len() < 2_000_000,
+        "hostile maxima emitted {} bytes",
+        text.len()
+    );
+    assert!(
+        prog.exprs < 200_000,
+        "hostile maxima generated {} exprs",
+        prog.exprs
+    );
+}
+
 /// Zero maxima must still generate a complete program: no panics on
 /// empty draws (`below(0)`), and the entry point must exist and print
 /// something even with no functions or globals to hash.
@@ -1327,6 +1420,67 @@ fn zero_options_generate_cleanly() {
             assert!(
                 text.contains("checksum:") || text.contains("\"done\""),
                 "{args:?} seed {seed}: entry prints nothing"
+            );
+        }
+    }
+}
+
+/// Every call head and bare function-valued symbol in user forms.
+fn collect_op_positions(forms: &[Form]) -> (HashSet<String>, HashSet<String>) {
+    let mut heads = HashSet::new();
+    let mut bare = HashSet::new();
+    let mut stack: Vec<(&Form, bool)> = forms.iter().map(|f| (f, false)).collect();
+    while let Some((f, _)) = stack.pop() {
+        match f {
+            Form::Symbol(s) => {
+                bare.insert(s.clone());
+            }
+            Form::List(fs) => {
+                if let Some(head) = fs.first().and_then(sym) {
+                    heads.insert(head.to_string());
+                }
+                stack.extend(fs.iter().map(|g| (g, false)));
+            }
+            Form::Vector(v) | Form::Set(v) => stack.extend(v.iter().map(|g| (g, false))),
+            Form::Map(pairs) => {
+                stack.extend(pairs.iter().flat_map(|(k, v)| [k, v]).map(|g| (g, false)));
+            }
+            _ => {}
+        }
+    }
+    (heads, bare)
+}
+
+#[test]
+fn partial_ops_are_banned_under_safe_math() {
+    // `/`, `quot`, `rem` throw on a zero divisor; under safe math user
+    // code must only reach them through the total `s-` wrappers — as
+    // call heads and as bare function values (which HOF could apply).
+    // Under `--no-safe-math` the ban lifts and the wrappers vanish.
+    let safe = parse_generator_args(Vec::<String>::new()).unwrap();
+    let raw = parse_generator_args(vec!["--no-safe-math"]).unwrap();
+    // prog.forms = [ns, ...preamble, ...user]; the preamble legitimately
+    // uses raw ops inside the wrapper definitions, so skip that prefix.
+    let skip = 1 + clojure_smith::preamble::preamble_forms().len();
+    for seed in 0..40 {
+        let prog = gen_program(&safe, seed);
+        let (heads, bare) = collect_op_positions(&prog.forms[skip..]);
+        for op in ["/", "quot", "rem"] {
+            assert!(!heads.contains(op), "seed {seed}: raw `{op}` call head");
+            assert!(!bare.contains(op), "seed {seed}: raw `{op}` as value");
+        }
+        let prog = gen_program(&raw, seed);
+        let (heads, bare) = collect_op_positions(&prog.forms[skip..]);
+        for op in [
+            "s-div", "s-quot", "s-rem", "s+", "s-", "s-neg", "s-inc", "s-dec",
+        ] {
+            assert!(
+                !heads.contains(op),
+                "seed {seed}: wrapper `{op}` under --no-safe-math"
+            );
+            assert!(
+                !bare.contains(op),
+                "seed {seed}: wrapper `{op}` value under --no-safe-math"
             );
         }
     }

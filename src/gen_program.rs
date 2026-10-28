@@ -8,7 +8,11 @@
 use crate::form::{Form, print_pretty};
 use crate::gen_expr::Ctx;
 use crate::gen_func::gen_func;
-use crate::options::GenerateOptions;
+use crate::options::{GenerateOptions, MAX_FUNCS, MAX_GLOBALS, MAX_RECORD_FIELDS, MAX_RECORDS};
+
+/// Cap on total printed bytes of global initializers. Literals are
+/// budget-clamped per global against the remainder of this cap.
+const GLOBAL_INIT_BYTES: u64 = 1_000_000;
 use crate::preamble::{entry_forms, ns_form, preamble_forms};
 use crate::rng::Rng;
 use crate::types::{RecordDef, gen_literal, random_scalar_type, random_type};
@@ -27,18 +31,23 @@ pub struct Program {
 pub fn gen_program(opts: &GenerateOptions, seed: i64) -> Program {
     let mut rng = Rng::new(seed as u64);
     let mut ctx = Ctx::new(opts, &mut rng);
+    ctx.deadline = opts.gen_timeout.map(|t| std::time::Instant::now() + t);
 
     // Records first: globals and functions may reference them.
+    // Draws clamp to the validated ceilings so library users who skip
+    // validate() cannot stall generation with absurd maxima.
     let n_records = if opts.no_records {
         0
     } else {
-        ctx.rng.range_usize(0, opts.max_records as usize)
+        ctx.rng
+            .range_usize(0, opts.max_records.min(MAX_RECORDS) as usize)
     };
     let mut record_forms = Vec::with_capacity(n_records);
     for i in 0..n_records {
-        let nf = ctx
-            .rng
-            .range_usize(1, opts.max_record_fields.max(1) as usize);
+        let nf = ctx.rng.range_usize(
+            1,
+            opts.max_record_fields.clamp(1, MAX_RECORD_FIELDS) as usize,
+        );
         let mut fields = Vec::with_capacity(nf);
         for j in 0..nf {
             fields.push((format!("f{j}"), random_scalar_type(ctx.rng, ctx.opts)));
@@ -57,14 +66,19 @@ pub fn gen_program(opts: &GenerateOptions, seed: i64) -> Program {
     let n_globals = if opts.no_globals {
         0
     } else {
-        ctx.rng.range_usize(0, opts.max_globals as usize)
+        ctx.rng
+            .range_usize(0, opts.max_globals.min(MAX_GLOBALS) as usize)
     };
     let mut global_names = Vec::with_capacity(n_globals);
     let mut global_forms = Vec::with_capacity(n_globals);
+    // Global initializers run once at load, so they are not charged to a
+    // function budget; instead their total printed size is capped here.
+    let mut gbytes = 0u64;
     for i in 0..n_globals {
         let gt = random_type(ctx.rng, ctx.opts, &ctx.env.records);
-        // Global initializers run once at load; not charged to any budget.
-        let (init, _) = gen_literal(ctx.rng, ctx.opts, &ctx.env.records, &gt);
+        let budget = GLOBAL_INIT_BYTES.saturating_sub(gbytes);
+        let (init, icost) = gen_literal(ctx.rng, ctx.opts, &ctx.env.records, &gt, budget);
+        gbytes = gbytes.saturating_add(icost);
         let name = format!("g{i}");
         global_forms.push(Form::call(
             "def",
@@ -78,7 +92,8 @@ pub fn gen_program(opts: &GenerateOptions, seed: i64) -> Program {
     let n_funcs = if opts.max_funcs == 0 {
         0
     } else {
-        ctx.rng.range_usize(1, opts.max_funcs as usize)
+        ctx.rng
+            .range_usize(1, opts.max_funcs.min(MAX_FUNCS) as usize)
     };
     let mut func_forms = Vec::with_capacity(n_funcs);
     for i in 0..n_funcs {
@@ -111,7 +126,8 @@ pub fn gen_program(opts: &GenerateOptions, seed: i64) -> Program {
                     let g = gd[ctx.rng.below(gd.len())].clone();
                     args.push(Form::Deref(Box::new(Form::sym(g))));
                 } else {
-                    let (lit, cost) = gen_literal(ctx.rng, ctx.opts, &ctx.env.records, pt);
+                    let rem = ctx.remaining();
+                    let (lit, cost) = gen_literal(ctx.rng, ctx.opts, &ctx.env.records, pt, rem);
                     ctx.charge(cost);
                     args.push(lit);
                 }

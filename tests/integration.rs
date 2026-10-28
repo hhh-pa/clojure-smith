@@ -275,3 +275,37 @@ fn suppressed_programs_run() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn drive_no_checksum_runs_and_warns() {
+    if !clojure_available() {
+        eprintln!("skipping: clojure not on PATH");
+        return;
+    }
+    let dir = tmpdir("drive-nc");
+    let out = Command::new(binary())
+        .args([
+            "drive",
+            "--seeds",
+            "1-2",
+            "--jobs",
+            "1",
+            "--quiet",
+            "--fail-dir",
+        ])
+        .arg(dir.join("failures"))
+        .args(["--", "--no-checksum"])
+        .output()
+        .expect("spawn drive");
+    assert!(out.status.success(), "drive failed: {out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("disables the differential oracle"),
+        "missing warning: {err:?}"
+    );
+    assert!(
+        err.contains("2 ok, 0 mismatch, 0 error"),
+        "missing summary: {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

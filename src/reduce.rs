@@ -57,7 +57,18 @@ struct Reducer {
     used: u64,
     tmp: PathBuf,
     last: Option<crate::driver::RunOutcome>,
+    /// Environment failure (candidate staging or test spawn), distinct
+    /// from an uninteresting verdict.
+    env_error: Option<String>,
+    /// Consecutive environment failures; abort past [`MAX_CONSEC_ENV_FAIL`].
+    /// Timeouts are verdicts, not environment failures.
+    consec_env_fail: u32,
 }
+
+/// Abort reduction after this many consecutive environment failures
+/// (broken staging or an unspawnable test): every further evaluation
+/// would misjudge.
+const MAX_CONSEC_ENV_FAIL: u32 = 3;
 
 impl Reducer {
     fn is_interesting(&mut self, forms: &[Form]) -> bool {
@@ -70,18 +81,33 @@ impl Reducer {
             text.push_str(&print_compact(f));
             text.push('\n');
         }
-        if std::fs::write(&self.tmp, &text).is_err() {
+        if let Err(e) = std::fs::write(&self.tmp, &text) {
+            self.note_env_fail(format!("cannot stage candidate: {e}"));
             return false;
         }
         let o = run_command(&self.test, &self.tmp, self.timeout);
-        let interesting = o.spawn_error.is_none()
-            && (o.exit == Some(0) || (self.timeout_is_interesting && o.timed_out));
+        if let Some(e) = &o.spawn_error {
+            self.note_env_fail(format!("test command could not start: {e}"));
+            self.last = Some(o);
+            return false;
+        }
+        self.consec_env_fail = 0;
+        let interesting = o.exit == Some(0) || (self.timeout_is_interesting && o.timed_out);
         self.last = Some(o);
         interesting
     }
 
+    fn note_env_fail(&mut self, msg: String) {
+        self.env_error = Some(msg);
+        self.consec_env_fail = self.consec_env_fail.saturating_add(1);
+    }
+
     fn exhausted(&self) -> bool {
         self.limit > 0 && self.used >= self.limit
+    }
+
+    fn aborted(&self) -> bool {
+        self.consec_env_fail >= MAX_CONSEC_ENV_FAIL
     }
 }
 
@@ -236,7 +262,7 @@ fn ddmin_pass(r: &mut Reducer, mut forms: Vec<Form>) -> Vec<Form> {
     loop {
         let mut i = 0;
         while i < forms.len() {
-            if r.exhausted() {
+            if r.exhausted() || r.aborted() {
                 return forms;
             }
             let end = (i + size).min(forms.len());
@@ -261,7 +287,7 @@ fn scalar_pass(r: &mut Reducer, mut forms: Vec<Form>) -> Vec<Form> {
     let consts = consts();
     for idx in 0..forms.len() {
         loop {
-            if r.exhausted() {
+            if r.exhausted() || r.aborted() {
                 return forms;
             }
             let paths = collect_paths(&forms[idx]);
@@ -269,7 +295,7 @@ fn scalar_pass(r: &mut Reducer, mut forms: Vec<Form>) -> Vec<Form> {
             let mut changed = false;
             'paths: for path in &paths {
                 for c in &consts {
-                    if r.exhausted() {
+                    if r.exhausted() || r.aborted() {
                         return forms;
                     }
                     let replaced = replace_at(&forms[idx], path, c);
@@ -303,30 +329,93 @@ fn scalar_pass(r: &mut Reducer, mut forms: Vec<Form>) -> Vec<Form> {
 /// "not found" diagnostic rather than a spawn error. Returns the process
 /// exit code.
 fn report_uninteresting(r: &Reducer, timeout_is_interesting: bool) -> i32 {
+    let (msg, code) = uninteresting_message(r, timeout_is_interesting);
+    eprintln!("{msg}");
+    code
+}
+
+/// Explain an uninteresting input as `(message, exit code)`: a broken
+/// environment (exit 2) must not masquerade as an uninteresting case
+/// (exit 1).
+fn uninteresting_message(r: &Reducer, timeout_is_interesting: bool) -> (String, i32) {
+    if let Some(e) = &r.env_error {
+        return (format!("clojure-smith reduce: {e}"), 2);
+    }
     if let Some(o) = &r.last {
-        if let Some(e) = &o.spawn_error {
-            eprintln!("clojure-smith reduce: test command could not start: {e}");
-            return 2;
+        if o.timed_out && !timeout_is_interesting {
+            return (
+                "clojure-smith reduce: input is not interesting (test timed out; pass --timeout-is-interesting to reduce hangs)"
+                    .to_string(),
+                1,
+            );
         }
-        if o.exit == Some(127) {
-            let err = String::from_utf8_lossy(&o.err);
-            if err.contains("not found") {
-                let first = err.lines().next().unwrap_or("").trim();
-                eprintln!(
+        if o.exit == Some(127) && test_command_missing(&r.test, o) {
+            let first = String::from_utf8_lossy(&o.err)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let msg = if first.is_empty() {
+                "clojure-smith reduce: test command not found; check --test spelling".to_string()
+            } else {
+                format!(
                     "clojure-smith reduce: test command not found ({first}); check --test spelling"
-                );
-                return 2;
-            }
+                )
+            };
+            return (msg, 2);
         }
     }
     if timeout_is_interesting {
-        eprintln!(
+        (
             "clojure-smith reduce: input is not interesting (test exited nonzero without timing out)"
-        );
+                .to_string(),
+            1,
+        )
     } else {
-        eprintln!("clojure-smith reduce: input is not interesting (test exited nonzero)");
+        (
+            "clojure-smith reduce: input is not interesting (test exited nonzero)".to_string(),
+            1,
+        )
     }
-    1
+}
+
+/// Decide whether an exit-127 means the test command itself is missing:
+/// directly when its first word is absent from PATH, or when the shell's
+/// own diagnostic says so (covers scripts whose inner commands are
+/// missing).
+fn test_command_missing(test: &str, o: &crate::driver::RunOutcome) -> bool {
+    if first_word_missing(test) == Some(true) {
+        return true;
+    }
+    String::from_utf8_lossy(&o.err).contains("not found")
+}
+
+/// Whether the template's first word fails `command -v`; `None` when the
+/// probe itself cannot run, the template is empty, or the word looks like
+/// a flag (callers fall back to the stderr sniff then).
+fn first_word_missing(test: &str) -> Option<bool> {
+    let mut words = test.split_whitespace().peekable();
+    // Skip VAR=value environment prefixes.
+    while let Some(w) = words.peek() {
+        let mut chars = w.chars();
+        let is_assign =
+            matches!(chars.next(), Some(c) if c.is_alphabetic() || c == '_') && w.contains('=');
+        if !is_assign {
+            break;
+        }
+        words.next();
+    }
+    let word = words.next()?;
+    if word.is_empty() || word.starts_with('-') {
+        return None;
+    }
+    let quoted = format!("'{}'", word.replace('\'', "'\\''"));
+    let status = std::process::Command::new("sh")
+        .args(["-c", &format!("command -v {quoted} >/dev/null 2>&1")])
+        .status()
+        .ok()?;
+    Some(!status.success())
 }
 
 /// Try replacing every list-typed subform with each of its children.
@@ -335,7 +424,7 @@ fn report_uninteresting(r: &Reducer, timeout_is_interesting: bool) -> i32 {
 fn drop_pass(r: &mut Reducer, mut forms: Vec<Form>) -> Vec<Form> {
     for idx in 0..forms.len() {
         loop {
-            if r.exhausted() {
+            if r.exhausted() || r.aborted() {
                 return forms;
             }
             let paths = collect_paths(&forms[idx]);
@@ -343,7 +432,7 @@ fn drop_pass(r: &mut Reducer, mut forms: Vec<Form>) -> Vec<Form> {
             let mut changed = false;
             'paths: for path in &paths {
                 for kid in drop_kids(get_at(&forms[idx], path)) {
-                    if r.exhausted() {
+                    if r.exhausted() || r.aborted() {
                         return forms;
                     }
                     let replaced = replace_at(&forms[idx], path, &kid);
@@ -371,15 +460,15 @@ fn reduce_forms(r: &mut Reducer, mut forms: Vec<Form>) -> Vec<Form> {
     loop {
         let before = total_size(&forms);
         forms = ddmin_pass(r, forms);
-        if r.exhausted() {
+        if r.exhausted() || r.aborted() {
             return forms;
         }
         forms = scalar_pass(r, forms);
-        if r.exhausted() {
+        if r.exhausted() || r.aborted() {
             return forms;
         }
         forms = drop_pass(r, forms);
-        if r.exhausted() {
+        if r.exhausted() || r.aborted() {
             return forms;
         }
         if total_size(&forms) >= before {
@@ -415,11 +504,7 @@ pub fn run_reduce(opts: &ReduceOptions) -> i32 {
         eprintln!("clojure-smith reduce: input contains no forms");
         return 2;
     }
-    let tmp = std::env::temp_dir().join(format!(
-        "clojure-smith-reduce-{}-{}",
-        std::process::id(),
-        crate::driver::unique_tag()
-    ));
+    let tmp = crate::driver::secure_tmp("clojure-smith-reduce");
     let mut r = Reducer {
         test: opts.test.clone(),
         timeout: Duration::from_secs(opts.timeout),
@@ -428,6 +513,8 @@ pub fn run_reduce(opts: &ReduceOptions) -> i32 {
         used: 0,
         tmp: tmp.clone(),
         last: None,
+        env_error: None,
+        consec_env_fail: 0,
     };
     if !r.is_interesting(&forms) {
         let code = report_uninteresting(&r, opts.timeout_is_interesting);
@@ -438,6 +525,13 @@ pub fn run_reduce(opts: &ReduceOptions) -> i32 {
     let before_bytes = text.len();
     let reduced = reduce_forms(&mut r, forms);
     let _ = std::fs::remove_file(&tmp);
+    if r.aborted() {
+        eprintln!(
+            "clojure-smith reduce: aborting: test environment failing repeatedly ({})",
+            r.env_error.as_deref().unwrap_or("unknown error")
+        );
+        return 2;
+    }
 
     let mut out_text = String::new();
     for (i, f) in reduced.iter().enumerate() {
@@ -594,6 +688,125 @@ mod tests {
         assert_eq!(run_reduce(&opts), 0);
         let reduced = std::fs::read_to_string(&output).unwrap();
         assert_eq!(reduced.trim(), ":MAGIC", "{reduced:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn reducer_for(test: &str) -> Reducer {
+        Reducer {
+            test: test.to_string(),
+            timeout: Duration::from_secs(30),
+            timeout_is_interesting: false,
+            limit: 0,
+            used: 0,
+            tmp: std::path::PathBuf::from("unused"),
+            last: None,
+            env_error: None,
+            consec_env_fail: 0,
+        }
+    }
+
+    fn outcome() -> crate::driver::RunOutcome {
+        crate::driver::RunOutcome {
+            timed_out: false,
+            spawn_error: None,
+            exit: None,
+            signal: None,
+            truncated: false,
+            out: Vec::new(),
+            err: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn uninteresting_messages() {
+        // Environment failure: usage error, not a verdict.
+        let mut r = reducer_for("true {}");
+        r.env_error = Some("cannot stage candidate: nope".to_string());
+        let (msg, code) = uninteresting_message(&r, false);
+        assert_eq!(code, 2);
+        assert!(msg.contains("cannot stage candidate"), "{msg}");
+        // Initial timeout without the flag: hint at the flag.
+        let mut r = reducer_for("sleep 5 {}");
+        let mut o = outcome();
+        o.timed_out = true;
+        r.last = Some(o);
+        let (msg, code) = uninteresting_message(&r, false);
+        assert_eq!(code, 1);
+        assert!(msg.contains("--timeout-is-interesting"), "{msg}");
+        // Plain nonzero exit stays a quiet verdict.
+        let mut r = reducer_for("false {}");
+        let mut o = outcome();
+        o.exit = Some(1);
+        r.last = Some(o);
+        let (msg, code) = uninteresting_message(&r, false);
+        assert_eq!(code, 1);
+        assert!(msg.contains("exited nonzero"), "{msg}");
+    }
+
+    #[test]
+    fn env_failures_abort() {
+        let mut r = reducer_for("true {}");
+        r.tmp = std::env::temp_dir().join(format!(
+            "cs-nope-{}-{}/candidate",
+            std::process::id(),
+            crate::driver::unique_tag()
+        ));
+        let forms = vec![parse_one("(def a 1)").unwrap()];
+        for _ in 0..3 {
+            assert!(!r.is_interesting(&forms));
+        }
+        assert!(r.aborted());
+        assert!(r.env_error.as_deref().unwrap().contains("cannot stage"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_127_existing_command_is_verdict() {
+        // `sh` exists: a 127 from the test itself is a verdict (1),
+        // not a usage error (2).
+        let dir =
+            std::env::temp_dir().join(format!("cs-127-{}-{}", std::process::id(), unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("prog.clj");
+        std::fs::write(&input, "(println :hello)\n").unwrap();
+        let opts = ReduceOptions {
+            test: "sh -c 'exit 127' {}".to_string(),
+            input,
+            output: None,
+            tries: 100,
+            timeout: 30,
+            quiet: true,
+            timeout_is_interesting: false,
+        };
+        assert_eq!(run_reduce(&opts), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_is_interesting_reduces_hang() {
+        // Hangs iff the candidate mentions MAGIC: minimization must
+        // proceed to the smallest hanging form instead of refusing input.
+        let dir =
+            std::env::temp_dir().join(format!("cs-hang-{}-{}", std::process::id(), unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("prog.clj");
+        let output = dir.join("small.clj");
+        std::fs::write(&input, "(def MAGIC 1)\n(def b 2)\n").unwrap();
+        let opts = ReduceOptions {
+            test: "grep -q MAGIC {} && sleep 5".to_string(),
+            input,
+            output: Some(output.clone()),
+            tries: 100,
+            timeout: 1,
+            quiet: true,
+            timeout_is_interesting: true,
+        };
+        assert_eq!(run_reduce(&opts), 0);
+        let reduced = std::fs::read_to_string(&output).unwrap();
+        assert_eq!(reduced.trim(), "MAGIC", "{reduced:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

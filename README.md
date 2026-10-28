@@ -83,14 +83,14 @@ clojure-smith [OPTIONS]
 |------|---------|---------|
 | `--seed N` | random (reported) | RNG seed; same seed + options ⇒ byte-identical output |
 | `-o, --output FILE` | stdout | write program to FILE |
-| `--max-funcs N` | 5 | max generated functions |
+| `--max-funcs N` | 5 | max generated functions (≤ 1000) |
 | `--max-params N` | 3 | max params per function (≤ 20) |
-| `--max-globals N` | 4 | max global state atoms |
-| `--max-records N` | 2 | max record types |
-| `--max-record-fields N` | 4 | max fields per record |
-| `--max-block-depth N` | 3 | max control-form nesting |
-| `--max-block-size N` | 4 | max statements per body |
-| `--max-expr-depth N` | 4 | max expression nesting |
+| `--max-globals N` | 4 | max global state atoms (≤ 1000) |
+| `--max-records N` | 2 | max record types (≤ 100) |
+| `--max-record-fields N` | 4 | max fields per record (≤ 64) |
+| `--max-block-depth N` | 3 | max control-form nesting (≤ 32) |
+| `--max-block-size N` | 4 | max statements per body (≤ 128) |
+| `--max-expr-depth N` | 4 | max expression nesting (≤ 128) |
 | `--max-vector-len N` | 4 | max vector literal length (≤ 1024) |
 | `--max-map-size N` | 4 | max map size (≤ 8, see below) |
 | `--max-string-len N` | 16 | max string literal length (≤ 4096) |
@@ -132,6 +132,8 @@ another JDK, or extra `-J` flags. A seed is `OK` when every runner exits 0
 with byte-identical stdout, `MISMATCH` when outputs differ, and `ERROR` when
 any runner fails or times out (`--timeout`, default 120s). Failures are saved
 to `--fail-dir/seed-N/` with the program and each runner's outputs.
+Pass `--show-outputs` to also print each runner's stdout on a mismatch,
+and `--jobs N` (≤ 256) to run seeds in parallel.
 Exit codes: 0 when every seed agrees, 1 when any divergence was found,
 2 for bad usage, 3 when seeds failed without any clean comparison.
 
@@ -191,6 +193,11 @@ Totality and determinism come from a set of deliberate rules:
   never `clojure.core/hash`, whose algorithm a future Clojure could change.
 - **Boxed loop bindings**: `loop` inits are wrapped in `identity` so `recur`
   never trips over primitive locals.
+- **Bounded generation**: literals cost their printed bytes, large
+  literals shrink to fit the remaining budget, and the generator stops
+  cleanly when the budget runs out — hostile `--max-*` combinations
+  yield small programs, not multi-minute hangs. Library users can also
+  set a wall-clock generation deadline.
 
 Same seed + same options + same clojure-smith version ⇒ byte-identical
 program (the RNG stream is pinned via `Cargo.lock`, not promised across

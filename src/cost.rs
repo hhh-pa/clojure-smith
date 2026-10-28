@@ -10,9 +10,14 @@
 //! occur at any option setting.
 //!
 //! Units are abstract form-evaluation steps, which over-approximate real
-//! work: all branches of a conditional are charged although only one runs,
-//! and data-dependent amplification (scanning a large collection) is not
-//! tracked. Calibration is empirical — see the drive sweeps.
+//! work: all branches of a conditional are charged although only one runs.
+//! Literals are charged in printed bytes and loop trips shrink against
+//! per-trip cost, so every runtime value's construction is transitively
+//! byte-bounded; superlinear operators (`sort`, `join`, ...) pay a
+//! [`DATA_OP_PREMIUM`], and accumulator growth (geometric, linear, and
+//! nested) is trip-capped. Residual slow tails at extreme option maxima
+//! surface as drive errors via the wall-clock timeouts, never as hangs.
+//! Calibration is empirical — see the drive sweeps.
 
 /// Work units available to one generated function.
 pub const WORK_BUDGET_PER_FUNC: u64 = 8_000;
@@ -65,8 +70,9 @@ pub fn shrink_trips(drawn: i64, per_trip: u64, remaining: u64) -> i64 {
 /// Trip cap for a `loop` whose update mentions the accumulator `refs`
 /// times: each trip can grow the accumulator by up to `refs`x (e.g.
 /// `(vec (interleave acc acc))` doubles it), so trips are capped to keep
-/// `refs^trips` small. A single mention cannot amplify (`i64::MAX`
-/// leaves the other bounds in charge).
+/// `refs^trips` small. Single mentions are handled by
+/// [`linear_growth_cap`] instead (`i64::MAX` here leaves that bound in
+/// charge).
 pub fn acc_growth_cap(refs: usize) -> i64 {
     if refs <= 1 {
         i64::MAX
@@ -74,6 +80,31 @@ pub fn acc_growth_cap(refs: usize) -> i64 {
         (32 >> refs.min(5)).max(2)
     }
 }
+
+/// Trip cap for linear (`refs <= 1`) accumulation: each trip can add at
+/// most the update's own static bytes, so trips are capped to keep
+/// `trips * update_bytes` within `remaining`. Complements
+/// [`acc_growth_cap`], which covers geometric (`refs >= 2`) growth.
+pub fn linear_growth_cap(update_bytes: u64, remaining: u64) -> i64 {
+    (remaining / update_bytes.max(1)).min(i64::MAX as u64) as i64
+}
+
+/// Extra charge when emitting a data-size-sensitive operator (`sort`,
+/// `distinct`, `interleave`, `concat`, `str/join`). Node charges cannot
+/// see input bytes, so without a premium a tiny body sorting megabytes
+/// would draw hundreds of trips; the premium shrinks those draws.
+/// Linear small-constant scans (`count`, `compare`, `includes?`,
+/// `subvec`, `take`) carry no premium: their inputs are byte-bounded
+/// elsewhere (literals, ranges, capped loops), keeping them sub-ms.
+pub const DATA_OP_PREMIUM: u64 = 256;
+
+/// Trip cap for a growable loop whose update contains a nested
+/// value-producing loop (`loop`/`for`). Static per-trip charges cannot
+/// see the nested loop's runtime output size, so nesting multiplies
+/// production opaquely; few trips keep the product small. (Deeper
+/// compositions remain bounded by the wall-clock generation and runner
+/// timeouts rather than statically.)
+pub const NESTED_LOOP_TRIPS: i64 = 4;
 
 /// Per-collection take bound for `doseq`/`for` over `n_bindings` collections
 /// (cartesian trips) whose body costs `per_trip` per trip. Zero is valid
@@ -129,6 +160,16 @@ mod tests {
         assert_eq!(shrink_trips(30, 100, 50), 0);
         assert_eq!(shrink_trips(30, 0, 1_000), 30);
         assert_eq!(shrink_trips(-4, 100, 1_000), 0);
+    }
+
+    #[test]
+    fn linear_cap_bounds_addends() {
+        assert_eq!(linear_growth_cap(100, 8000), 80);
+        assert_eq!(linear_growth_cap(8000, 8000), 1);
+        assert_eq!(linear_growth_cap(1_000_000, 8000), 0);
+        assert_eq!(linear_growth_cap(0, 8000), 8000);
+        assert_eq!(linear_growth_cap(100, 0), 0);
+        assert_eq!(linear_growth_cap(1, u64::MAX), i64::MAX);
     }
 
     #[test]

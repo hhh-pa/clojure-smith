@@ -9,7 +9,7 @@
 //! are scalars. This deliberately excludes nested collections, which are
 //! future work (see the README).
 
-use crate::form::Form;
+use crate::form::{Form, print_compact};
 use crate::options::GenerateOptions;
 use crate::rng::Rng;
 
@@ -181,6 +181,10 @@ const DOUBLE_EDGES: &[f64] = &[
     3.14159,
     2.71828,
     f64::MAX,
+    f64::MIN,
+    -0.0,
+    5e-324,
+    -5e-324,
     f64::MIN_POSITIVE,
     f64::INFINITY,
     f64::NEG_INFINITY,
@@ -224,6 +228,11 @@ const TRICKY_STRINGS: &[&str] = &[
     "héllo",
     "tab\there",
     "quote\"inside",
+    "\r",
+    "a\rb",
+    "\u{8}",
+    "\u{c}",
+    "\u{7f}",
 ];
 
 const STR_ALPHABET: &[u8] =
@@ -238,58 +247,76 @@ pub const MAX_STRING_DRAW: usize = 4096;
 /// Hard ceiling on a drawn vector literal length (see `MAX_STRING_DRAW`).
 pub const MAX_VECTOR_DRAW: usize = 1024;
 
-fn gen_string(rng: &mut Rng, max_len: usize) -> String {
+fn gen_string(rng: &mut Rng, max_len: usize, budget: u64) -> String {
     if rng.chance(0.15) {
+        // Fixed short strings; the few bytes of overshoot past `budget`
+        // are negligible and keep tricky values in circulation.
         return rng.pick(TRICKY_STRINGS).to_string();
     }
-    let n = rng.below(max_len.min(MAX_STRING_DRAW) + 1);
+    let n = rng.below(max_len.min(MAX_STRING_DRAW).min(budget_usize(budget)) + 1);
     (0..n).map(|_| *rng.pick(STR_ALPHABET) as char).collect()
 }
 
-/// A random literal form of type `t`.
-/// A random literal of type `t`, with its work cost (node count).
+fn budget_usize(budget: u64) -> usize {
+    budget.min(usize::MAX as u64) as usize
+}
+
+/// A random literal of type `t`, with its work cost in printed bytes.
+///
+/// Draws are clamped to `budget` (split evenly across composite
+/// elements), so one literal can never allocate gigabytes no matter the
+/// option maxima; the cost accounts the literal's actual printed size,
+/// which bounds total literal bytes by the caller's budget.
 pub fn gen_literal(
     rng: &mut Rng,
     opts: &GenerateOptions,
     records: &[RecordDef],
     t: &ValType,
+    budget: u64,
 ) -> (Form, u64) {
     let form = match t {
         ValType::Long => Form::int(gen_long(rng)),
         ValType::Double => Form::float(gen_double(rng)),
         ValType::Bool => Form::boolean(rng.next_bool()),
-        ValType::Str => Form::string(gen_string(rng, opts.max_string_len as usize)),
+        ValType::Str => Form::string(gen_string(rng, opts.max_string_len as usize, budget)),
         ValType::Vec(elem) => {
-            let n = rng.below((opts.max_vector_len as usize).min(MAX_VECTOR_DRAW) + 1);
+            let max = (opts.max_vector_len as usize)
+                .min(MAX_VECTOR_DRAW)
+                .min(budget_usize(budget));
+            let n = rng.below(max + 1);
+            let per = budget / n.max(1) as u64;
             Form::vector(
                 (0..n)
-                    .map(|_| gen_literal(rng, opts, records, elem).0)
+                    .map(|_| gen_literal(rng, opts, records, elem, per).0)
                     .collect(),
             )
         }
         ValType::Map(val) => {
-            let n = rng.below(opts.max_map_size.min(8) as usize + 1);
+            let max = (opts.max_map_size.min(8) as usize).min(budget_usize(budget));
+            let n = rng.below(max + 1);
+            let per = budget / n.max(1) as u64;
             let mut keys = MAP_KEYS.to_vec();
             rng.shuffle(&mut keys);
             Form::map(
                 keys.into_iter()
                     .take(n)
-                    .map(|k| (Form::kw(k), gen_literal(rng, opts, records, val).0))
+                    .map(|k| (Form::kw(k), gen_literal(rng, opts, records, val, per).0))
                     .collect(),
             )
         }
         ValType::Record(i) => {
             let r = &records[*i];
+            let per = budget / r.fields.len().max(1) as u64;
             Form::call(
                 &r.ctor_name(),
                 r.fields
                     .iter()
-                    .map(|(_, ft)| gen_literal(rng, opts, records, ft).0)
+                    .map(|(_, ft)| gen_literal(rng, opts, records, ft, per).0)
                     .collect(),
             )
         }
     };
-    let cost = form.size() as u64;
+    let cost = print_compact(&form).len() as u64;
     (form, cost)
 }
 
@@ -318,7 +345,7 @@ pub fn default_value(records: &[RecordDef], t: &ValType) -> Form {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::form::print_compact;
+    use crate::form::{parse_one, print_compact};
     use crate::options::parse_generator_args;
 
     fn opts(args: &[&str]) -> GenerateOptions {
@@ -355,13 +382,20 @@ mod tests {
         let o = opts(&["--max-string-len", "1000000", "--max-vector-len", "1000000"]);
         let mut rng = Rng::new(7);
         for _ in 0..50 {
-            let lit = gen_literal(&mut rng, &o, &[], &ValType::Str).0;
+            let lit = gen_literal(&mut rng, &o, &[], &ValType::Str, u64::MAX).0;
             if let Form::Str(s) = lit {
                 assert!(s.len() <= MAX_STRING_DRAW, "string len {}", s.len());
             } else {
                 panic!("expected string literal, got {lit:?}");
             }
-            let lit = gen_literal(&mut rng, &o, &[], &ValType::Vec(Box::new(ValType::Long))).0;
+            let lit = gen_literal(
+                &mut rng,
+                &o,
+                &[],
+                &ValType::Vec(Box::new(ValType::Long)),
+                u64::MAX,
+            )
+            .0;
             if let Form::Vector(v) = lit {
                 assert!(v.len() <= MAX_VECTOR_DRAW, "vector len {}", v.len());
             } else {
@@ -371,18 +405,110 @@ mod tests {
     }
 
     #[test]
+    fn literal_cost_is_printed_bytes() {
+        let o = opts(&[]);
+        let mut rng = Rng::new(9);
+        let types = [
+            ValType::Long,
+            ValType::Double,
+            ValType::Bool,
+            ValType::Str,
+            ValType::Vec(Box::new(ValType::Long)),
+            ValType::Vec(Box::new(ValType::Str)),
+            ValType::Map(Box::new(ValType::Str)),
+        ];
+        for t in &types {
+            for _ in 0..20 {
+                let (lit, cost) = gen_literal(&mut rng, &o, &[], t, u64::MAX);
+                assert_eq!(cost, print_compact(&lit).len() as u64, "{t:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn literal_draws_fit_budget() {
+        // Even with absurd maxima, a small budget yields a small literal:
+        // punctuation overhead is the only slack over the budget.
+        let o = opts(&["--max-string-len", "1000000", "--max-vector-len", "1000000"]);
+        let mut rng = Rng::new(11);
+        for _ in 0..50 {
+            let (lit, cost) = gen_literal(
+                &mut rng,
+                &o,
+                &[],
+                &ValType::Vec(Box::new(ValType::Str)),
+                1000,
+            );
+            let bytes = print_compact(&lit).len();
+            assert_eq!(cost, bytes as u64);
+            assert!(bytes <= 8000, "budget 1000 drew {bytes} bytes");
+        }
+        // Zero budget still yields well-typed (empty) literals.
+        let (lit, _) = gen_literal(&mut rng, &o, &[], &ValType::Str, 0);
+        assert!(matches!(lit, Form::Str(s) if s.len() <= 12));
+    }
+
+    #[test]
+    fn double_edges_cover_the_nasty_values() {
+        // The differential oracle is only as good as the edges it draws:
+        // infinities, NaN, signed zero, smallest normal/denormal, and
+        // extremes must all survive future edits of the table.
+        assert!(DOUBLE_EDGES.contains(&f64::INFINITY));
+        assert!(DOUBLE_EDGES.contains(&f64::NEG_INFINITY));
+        // NaN stays OUT of the table by design (see gen_double): it
+        // poisons comparisons without adding signal. Runtime NaN (0/0)
+        // still exists, which is why sort-over-doubles is banned.
+        assert!(DOUBLE_EDGES.iter().all(|x| !x.is_nan()));
+        // (`contains` is useless for signed zero: -0.0 == 0.0.)
+        assert!(DOUBLE_EDGES.iter().any(|x| x.to_bits() == 0.0f64.to_bits()));
+        assert!(
+            DOUBLE_EDGES
+                .iter()
+                .any(|x| x.to_bits() == (-0.0f64).to_bits())
+        );
+        assert!(DOUBLE_EDGES.contains(&f64::MIN));
+        assert!(DOUBLE_EDGES.contains(&f64::MAX));
+        assert!(DOUBLE_EDGES.contains(&f64::MIN_POSITIVE));
+        assert!(DOUBLE_EDGES.contains(&5e-324));
+        assert!(DOUBLE_EDGES.contains(&-5e-324));
+        assert!(LONG_EDGES.contains(&i64::MIN));
+        assert!(LONG_EDGES.contains(&i64::MAX));
+    }
+
+    #[test]
+    fn tricky_strings_survive_printer_roundtrip() {
+        // Every tricky string must print and re-parse to the identical string.
+        for s in TRICKY_STRINGS {
+            let printed = print_compact(&Form::Str((*s).to_owned()));
+            let parsed = parse_one(&printed).unwrap_or_else(|e| panic!("{s:?} -> {printed} : {e}"));
+            assert_eq!(
+                parsed,
+                Form::Str((*s).to_owned()),
+                "'{printed}' changed meaning"
+            );
+        }
+    }
+
+    #[test]
     fn literals_print_and_vary() {
         let o = opts(&[]);
         let mut rng = Rng::new(2);
         let mut seen = std::collections::HashSet::new();
         for _ in 0..50 {
-            let lit = gen_literal(&mut rng, &o, &[], &ValType::Long).0;
+            let lit = gen_literal(&mut rng, &o, &[], &ValType::Long, u64::MAX).0;
             seen.insert(print_compact(&lit));
         }
         assert!(seen.len() > 10, "long literals lack variety: {seen:?}");
         // Map literals stay within the key pool.
         for _ in 0..50 {
-            let lit = gen_literal(&mut rng, &o, &[], &ValType::Map(Box::new(ValType::Long))).0;
+            let lit = gen_literal(
+                &mut rng,
+                &o,
+                &[],
+                &ValType::Map(Box::new(ValType::Long)),
+                u64::MAX,
+            )
+            .0;
             if let Form::Map(pairs) = lit {
                 assert!(pairs.len() <= 4);
                 for (k, _) in &pairs {
@@ -408,7 +534,7 @@ mod tests {
                 ("f1".to_string(), ValType::Str),
             ],
         }];
-        let lit = gen_literal(&mut rng, &o, &records, &ValType::Record(0)).0;
+        let lit = gen_literal(&mut rng, &o, &records, &ValType::Record(0), u64::MAX).0;
         let text = print_compact(&lit);
         assert!(text.starts_with("(->rec0 "), "{text}");
         assert_eq!(

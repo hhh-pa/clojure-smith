@@ -35,7 +35,12 @@ pub fn gen_func(ctx: &mut Ctx, idx: usize) -> GeneratedFunc {
         params.push(ValType::Long);
         param_names.push("fuel".to_string());
     }
-    let n_params = ctx.rng.range_usize(0, max_params);
+    // Recursive functions already took the fuel slot above; the draw is
+    // capped so the total never exceeds max_params (Clojure rejects
+    // arities above 20, which validate() enforces as the maximum).
+    let n_params = ctx
+        .rng
+        .range_usize(0, max_params.min(20).saturating_sub(usize::from(recursive)));
     for _ in 0..n_params {
         params.push(random_type(ctx.rng, ctx.opts, &ctx.env.records));
         param_names.push(ctx.fresh("p"));

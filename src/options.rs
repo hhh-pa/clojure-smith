@@ -6,6 +6,20 @@
 use clap::Args;
 use std::path::PathBuf;
 
+/// Ceilings for the count/depth options. Generation draws scale linearly
+/// with these maxima and straight-line statements are only budget-shaped,
+/// so unbounded values stall the generator and breach JVM limits (64KB
+/// methods, ~100-field defrecords, deep analyzer recursion). Loop iters
+/// and recursion fuel keep the generic 1M ceiling: both shrink soundly
+/// to the remaining budget.
+pub const MAX_FUNCS: u32 = 1000;
+pub const MAX_GLOBALS: u32 = 1000;
+pub const MAX_RECORDS: u32 = 100;
+pub const MAX_RECORD_FIELDS: u32 = 64;
+pub const MAX_BLOCK_DEPTH: u32 = 32;
+pub const MAX_BLOCK_SIZE: u32 = 128;
+pub const MAX_EXPR_DEPTH: u32 = 128;
+
 /// Options controlling the random program generator.
 ///
 /// Used directly by the default (generate) mode, and also parsed from the
@@ -21,7 +35,7 @@ pub struct GenerateOptions {
     #[arg(short, long, value_name = "FILE")]
     pub output: Option<PathBuf>,
 
-    /// Maximum number of generated functions.
+    /// Maximum number of generated functions (at most 1000).
     #[arg(long, default_value_t = 5)]
     pub max_funcs: u32,
 
@@ -29,27 +43,27 @@ pub struct GenerateOptions {
     #[arg(long, default_value_t = 3)]
     pub max_params: u32,
 
-    /// Maximum number of global state atoms.
+    /// Maximum number of global state atoms (at most 1000).
     #[arg(long, default_value_t = 4)]
     pub max_globals: u32,
 
-    /// Maximum number of record types.
+    /// Maximum number of record types (at most 100).
     #[arg(long, default_value_t = 2)]
     pub max_records: u32,
 
-    /// Maximum number of fields per record type.
+    /// Maximum number of fields per record type (at most 64).
     #[arg(long, default_value_t = 4)]
     pub max_record_fields: u32,
 
-    /// Maximum nesting depth of control forms (let/if/loop/case/cond).
+    /// Maximum nesting depth of control forms (let/if/loop/case/cond; at most 32).
     #[arg(long, default_value_t = 3)]
     pub max_block_depth: u32,
 
-    /// Maximum number of statements per body.
+    /// Maximum number of statements per body (at most 128).
     #[arg(long, default_value_t = 4)]
     pub max_block_size: u32,
 
-    /// Maximum nesting depth of expressions.
+    /// Maximum nesting depth of expressions (at most 128).
     #[arg(long, default_value_t = 4)]
     pub max_expr_depth: u32,
 
@@ -132,6 +146,12 @@ pub struct GenerateOptions {
     /// Suppress the statistics comment and stderr chatter.
     #[arg(long)]
     pub quiet: bool,
+
+    /// Wall-clock budget for generating one program. Not a CLI flag: the
+    /// driver sets it from `--timeout` so hostile options fail the seed
+    /// instead of stalling the drive; interactive generation is unbounded.
+    #[arg(skip)]
+    pub gen_timeout: Option<std::time::Duration>,
 }
 
 impl GenerateOptions {
@@ -166,19 +186,23 @@ impl GenerateOptions {
                 crate::types::MAX_STRING_DRAW
             ));
         }
-        for (name, value) in [
-            ("--max-funcs", self.max_funcs),
-            ("--max-globals", self.max_globals),
-            ("--max-records", self.max_records),
-            ("--max-record-fields", self.max_record_fields),
-            ("--max-block-depth", self.max_block_depth),
-            ("--max-block-size", self.max_block_size),
-            ("--max-expr-depth", self.max_expr_depth),
-            ("--max-loop-iters", self.max_loop_iters),
-            ("--max-recursion-depth", self.max_recursion_depth),
+        for (name, value, ceil) in [
+            ("--max-funcs", self.max_funcs, MAX_FUNCS),
+            ("--max-globals", self.max_globals, MAX_GLOBALS),
+            ("--max-records", self.max_records, MAX_RECORDS),
+            (
+                "--max-record-fields",
+                self.max_record_fields,
+                MAX_RECORD_FIELDS,
+            ),
+            ("--max-block-depth", self.max_block_depth, MAX_BLOCK_DEPTH),
+            ("--max-block-size", self.max_block_size, MAX_BLOCK_SIZE),
+            ("--max-expr-depth", self.max_expr_depth, MAX_EXPR_DEPTH),
+            ("--max-loop-iters", self.max_loop_iters, 1_000_000),
+            ("--max-recursion-depth", self.max_recursion_depth, 1_000_000),
         ] {
-            if value > 1_000_000 {
-                return Err(format!("{name} is unreasonably large: {value}"));
+            if value > ceil {
+                return Err(format!("{name} cannot exceed {ceil}"));
             }
         }
         Ok(())
@@ -321,6 +345,29 @@ mod tests {
         o.max_string_len = crate::types::MAX_STRING_DRAW as u32;
         o.max_vector_len = crate::types::MAX_VECTOR_DRAW as u32;
         o.validate().expect("ceilings themselves validate");
+    }
+
+    #[test]
+    fn ceilings_reject_generator_explosion() {
+        // (field setter, ceiling): each maximum is rejected one past it.
+        type Setter = fn(&mut GenerateOptions, u32);
+        let cases: Vec<(Setter, u32)> = vec![
+            (|o, v| o.max_funcs = v, MAX_FUNCS),
+            (|o, v| o.max_globals = v, MAX_GLOBALS),
+            (|o, v| o.max_records = v, MAX_RECORDS),
+            (|o, v| o.max_record_fields = v, MAX_RECORD_FIELDS),
+            (|o, v| o.max_block_depth = v, MAX_BLOCK_DEPTH),
+            (|o, v| o.max_block_size = v, MAX_BLOCK_SIZE),
+            (|o, v| o.max_expr_depth = v, MAX_EXPR_DEPTH),
+        ];
+        for (set, ceil) in cases {
+            let mut o = defaults();
+            set(&mut o, ceil + 1);
+            assert!(o.validate().is_err(), "ceiling {ceil} not enforced");
+            let mut o = defaults();
+            set(&mut o, ceil);
+            o.validate().expect("ceiling itself validates");
+        }
     }
 
     #[test]

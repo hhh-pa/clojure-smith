@@ -7,7 +7,7 @@
 //! through the total helpers from the preamble, and all loops and recursion
 //! carry explicit constant bounds.
 
-use crate::form::Form;
+use crate::form::{Form, print_compact};
 use crate::options::GenerateOptions;
 use crate::rng::Rng;
 use crate::types::{
@@ -15,6 +15,13 @@ use crate::types::{
     random_type,
 };
 use std::collections::HashSet;
+use std::time::Instant;
+
+/// Marker panic payload when generation exceeds its wall-clock deadline
+/// (see [`Ctx::deadline`]). The driver catches it and fails the seed
+/// instead of stalling the whole drive.
+#[derive(Debug)]
+pub struct GenTimeout;
 
 /// A generated function's signature.
 #[derive(Clone, Debug)]
@@ -84,12 +91,19 @@ pub struct Ctx<'a> {
     pub spent: u64,
     /// Work budget for the function currently generated.
     pub budget: u64,
+    /// Wall-clock deadline for generation, if any. [`Ctx::charge`] checks
+    /// it and panics with [`GenTimeout`] past the deadline, so hostile
+    /// option combinations stall one seed instead of the whole drive.
+    /// `None` (interactive generation, tests) means unbounded.
+    pub deadline: Option<Instant>,
 }
 
 impl<'a> Ctx<'a> {
     pub fn new(opts: &'a GenerateOptions, rng: &'a mut Rng) -> Self {
-        let depth = opts.max_expr_depth;
-        let block_depth = opts.max_block_depth;
+        // Clamp to the validated ceilings so library users who skip
+        // validate() cannot recurse the generator off its stack.
+        let depth = opts.max_expr_depth.min(crate::options::MAX_EXPR_DEPTH);
+        let block_depth = opts.max_block_depth.min(crate::options::MAX_BLOCK_DEPTH);
         Self {
             opts,
             rng,
@@ -106,6 +120,7 @@ impl<'a> Ctx<'a> {
             self_sites: 0,
             spent: 0,
             budget: crate::cost::WORK_BUDGET_PER_FUNC,
+            deadline: None,
         }
     }
 
@@ -115,7 +130,13 @@ impl<'a> Ctx<'a> {
     }
 
     /// Charge `n` work units against the current budget (saturating).
+    /// Past [`Ctx::deadline`], panics with [`GenTimeout`] instead.
     pub fn charge(&mut self, n: u64) {
+        if let Some(d) = self.deadline
+            && Instant::now() >= d
+        {
+            std::panic::panic_any(GenTimeout);
+        }
         self.spent = self.spent.saturating_add(n);
     }
 
@@ -280,7 +301,10 @@ fn pick_kind(ctx: &mut Ctx, kinds: &[(u64, u8)]) -> u8 {
 pub fn gen_expr(ctx: &mut Ctx, t: &ValType) -> Form {
     ctx.exprs += 1;
     ctx.charge(1);
-    if ctx.depth == 0 {
+    // The budget is a hard stop, not just an accounting device: with no
+    // units left, only a (budget-clamped) leaf is generated. This bounds
+    // straight-line code that shrinking never touches.
+    if ctx.depth == 0 || ctx.remaining() == 0 {
         return gen_leaf(ctx, t);
     }
     let no_loops = ctx.opts.no_loops;
@@ -325,7 +349,8 @@ pub fn gen_body(ctx: &mut Ctx, t: &ValType, max_stmts: u32) -> Vec<Form> {
     let n = if max_stmts == 0 {
         0
     } else {
-        ctx.rng.range_usize(0, max_stmts as usize)
+        ctx.rng
+            .range_usize(0, max_stmts.min(crate::options::MAX_BLOCK_SIZE) as usize)
     };
     let mut body = Vec::with_capacity(n + 1);
     for _ in 0..n {
@@ -391,7 +416,8 @@ fn gen_leaf(ctx: &mut Ctx, t: &ValType) -> Form {
         let i = ctx.rng.below(vars.len());
         vars.swap_remove(i)
     } else {
-        let (lit, cost) = gen_literal(ctx.rng, ctx.opts, &ctx.env.records, t);
+        let rem = ctx.remaining();
+        let (lit, cost) = gen_literal(ctx.rng, ctx.opts, &ctx.env.records, t, rem);
         ctx.charge(cost);
         lit
     }
@@ -432,6 +458,20 @@ fn gen_let(ctx: &mut Ctx, t: &ValType) -> Form {
     })
 }
 
+/// True when `form` contains a nested loop of any kind. Inside a
+/// loop update, nested loops multiply per-trip work and value
+/// production beyond what static charges can see.
+fn contains_nested_loop(form: &Form) -> bool {
+    let mut stack = vec![form];
+    while let Some(f) = stack.pop() {
+        if matches!(f.head_symbol(), Some("loop" | "for" | "dotimes" | "doseq")) {
+            return true;
+        }
+        stack.extend(f.children());
+    }
+    false
+}
+
 fn gen_loop(ctx: &mut Ctx, t: &ValType) -> Form {
     nested(ctx, 1, 1, |ctx| {
         ctx.in_loop += 1;
@@ -464,7 +504,19 @@ fn gen_loop(ctx: &mut Ctx, t: &ValType) -> Form {
         // result stays small. Scalars cannot grow, records have fixed
         // fields, so those keep the full trip range.
         if matches!(t, ValType::Vec(_) | ValType::Map(_) | ValType::Str) {
-            iters = iters.min(crate::cost::acc_growth_cap(update.count_sym("acc")));
+            let refs = update.count_sym("acc");
+            iters = iters.min(crate::cost::acc_growth_cap(refs));
+            if refs == 1 {
+                // Linear growth: each trip adds at most the update's
+                // own static bytes.
+                let bytes = print_compact(&update).len() as u64;
+                iters = iters.min(crate::cost::linear_growth_cap(bytes, ctx.remaining()));
+            }
+            if contains_nested_loop(&update) {
+                // Nested loops multiply production opaquely (per-trip
+                // charges see static size, not runtime output size).
+                iters = iters.min(crate::cost::NESTED_LOOP_TRIPS);
+            }
         }
         ctx.charge(
             (iters.max(0) as u64)
@@ -1390,7 +1442,9 @@ fn gen_str_pred(ctx: &mut Ctx) -> Form {
                 // on the default locale and would be nondeterministic.
                 let op = ["str/includes?", "str/starts-with?", "str/ends-with?"][n - 1];
                 let a = gen_expr(ctx, &ValType::Str);
-                let (b, bcost) = gen_literal(ctx.rng, ctx.opts, &ctx.env.records, &ValType::Str);
+                let rem = ctx.remaining();
+                let (b, bcost) =
+                    gen_literal(ctx.rng, ctx.opts, &ctx.env.records, &ValType::Str, rem);
                 ctx.charge(bcost);
                 Form::call(op, vec![a, b])
             }
@@ -1435,8 +1489,10 @@ fn gen_str_op(ctx: &mut Ctx) -> Form {
             Form::call("s-subs", vec![s, a, b])
         }),
         2 => nested(ctx, 1, 0, |ctx| {
-            let (sep, scost) = gen_literal(ctx.rng, ctx.opts, &ctx.env.records, &ValType::Str);
+            let rem = ctx.remaining();
+            let (sep, scost) = gen_literal(ctx.rng, ctx.opts, &ctx.env.records, &ValType::Str, rem);
             ctx.charge(scost);
+            ctx.charge(crate::cost::DATA_OP_PREMIUM);
             let coll = gen_expr(ctx, &ValType::Vec(Box::new(ValType::Str)));
             Form::call("str/join", vec![sep, coll])
         }),
@@ -1510,7 +1566,10 @@ fn gen_vec_op(ctx: &mut Ctx, e: &ValType) -> Form {
     debug_assert!(!ctx.opts.no_vectors);
     let o = ctx.opts;
     let mut kinds: Vec<(u64, u8)> = vec![(4, 0), (2, 1), (1, 2), (2, 3), (2, 4)];
-    if e.is_scalar() {
+    // No `sort` over doubles: `(compare ##NaN x)` is 0 for every x, so
+    // the comparator is inconsistent and TimSort's behavior (garbage
+    // order or IllegalArgumentException) is implementation-defined.
+    if matches!(e, ValType::Long | ValType::Bool | ValType::Str) {
         kinds.push((1, 5));
     }
     kinds.push((1, 6));
@@ -1566,10 +1625,12 @@ fn gen_vec_op(ctx: &mut Ctx, e: &ValType) -> Form {
             Form::call(op, vec![n, v])
         }),
         5 => nested(ctx, 1, 0, |ctx| {
+            ctx.charge(crate::cost::DATA_OP_PREMIUM);
             let v = gen_expr(ctx, &ValType::Vec(Box::new(e.clone())));
             Form::call("vec", vec![Form::call("sort", vec![v])])
         }),
         6 => nested(ctx, 1, 0, |ctx| {
+            ctx.charge(crate::cost::DATA_OP_PREMIUM);
             let op = if ctx.rng.next_bool() {
                 "concat"
             } else {
@@ -1596,6 +1657,7 @@ fn gen_vec_op(ctx: &mut Ctx, e: &ValType) -> Form {
             Form::call("vec", vec![Form::call("vals", vec![m])])
         }),
         10 => nested(ctx, 1, 0, |ctx| {
+            ctx.charge(crate::cost::DATA_OP_PREMIUM);
             let v = gen_expr(ctx, &ValType::Vec(Box::new(e.clone())));
             Form::call("vec", vec![Form::call("distinct", vec![v])])
         }),
@@ -1799,11 +1861,59 @@ fn gen_record_op(ctx: &mut Ctx, idx: usize) -> Form {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::form::print_compact;
     use crate::options::parse_generator_args;
 
     fn ctx_for<'a>(opts: &'a GenerateOptions, rng: &'a mut Rng) -> Ctx<'a> {
         Ctx::new(opts, rng)
+    }
+
+    #[test]
+    fn expired_deadline_panics_with_gen_timeout() {
+        let opts = parse_generator_args::<Vec<String>, String>(Vec::new()).unwrap();
+        let mut rng = Rng::new(1);
+        let mut ctx = ctx_for(&opts, &mut rng);
+        ctx.deadline = Some(Instant::now() - std::time::Duration::from_secs(1));
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.charge(1)))
+            .expect_err("charge past deadline must panic");
+        assert!(err.is::<GenTimeout>(), "wrong panic payload");
+        // No deadline: charging is total.
+        let mut ctx = ctx_for(&opts, &mut rng);
+        ctx.charge(u64::MAX);
+        assert_eq!(ctx.remaining(), 0);
+    }
+
+    #[test]
+    fn sort_never_over_doubles() {
+        // NaN makes the sort comparator inconsistent (TimSort garbage or
+        // throw), so the sort arm is not offered for Double elements.
+        // Longs keep it (positive control against a dead arm).
+        fn is_sort(form: &Form) -> bool {
+            matches!(form, Form::List(fs)
+                if fs.len() == 2 && fs.first().and_then(sym) == Some("vec")
+                && matches!(&fs[1], Form::List(g) if g.first().and_then(sym) == Some("sort")))
+        }
+        fn sym(form: &Form) -> Option<&str> {
+            match form {
+                Form::Symbol(s) => Some(s.as_str()),
+                _ => None,
+            }
+        }
+        let opts = parse_generator_args::<Vec<String>, String>(Vec::new()).unwrap();
+        for seed in 0..500 {
+            let mut rng = Rng::new(seed);
+            let mut ctx = ctx_for(&opts, &mut rng);
+            let d = gen_vec_op(&mut ctx, &ValType::Double);
+            assert!(!is_sort(&d), "sorted doubles at seed {seed}: {d:?}");
+        }
+        let mut sorts = 0;
+        for seed in 0..500 {
+            let mut rng = Rng::new(100000 + seed);
+            let mut ctx = ctx_for(&opts, &mut rng);
+            if is_sort(&gen_vec_op(&mut ctx, &ValType::Long)) {
+                sorts += 1;
+            }
+        }
+        assert!(sorts > 0, "sort arm never fires for longs");
     }
 
     #[test]

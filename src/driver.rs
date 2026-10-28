@@ -12,7 +12,7 @@ use clap::Args;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::gen_program::{emit_program, gen_program};
@@ -38,11 +38,15 @@ pub struct DriveOptions {
     #[arg(long, default_value = "failures")]
     pub fail_dir: PathBuf,
 
-    /// Parallel jobs.
+    /// Parallel jobs (at most 256).
     #[arg(long, default_value_t = 1)]
     pub jobs: usize,
 
-    /// Only print failures and the summary.
+    /// On mismatch, also print each runner's captured stdout.
+    #[arg(long)]
+    pub show_outputs: bool,
+
+    /// Only print failures, warnings, and the summary.
     #[arg(long)]
     pub quiet: bool,
 
@@ -72,10 +76,45 @@ pub fn unique_tag() -> usize {
     UNIQUE.fetch_add(1, Ordering::SeqCst)
 }
 
+/// Build an unpredictable temp path: pid + counter + 64 random bits.
+/// Fully predictable sibling-writable paths let a local attacker
+/// pre-plant symlinks that redirect our writes elsewhere.
+pub fn secure_tmp(prefix: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}-{:016x}",
+        std::process::id(),
+        unique_tag(),
+        rand::random::<u64>()
+    ))
+}
+
+/// Stage `program` into a fresh unpredictable temp dir, returning
+/// `(dir, file)`. Retries on (implausible) collision instead of
+/// deleting whatever sits at the path.
+fn stage_program(seed: i64, program: &str) -> std::io::Result<(PathBuf, PathBuf)> {
+    let mut err = std::io::Error::other("tmp collision");
+    for _ in 0..3 {
+        let dir = secure_tmp(&format!("clojure-smith-{seed}"));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {
+                let file = dir.join("prog.clj");
+                std::fs::write(&file, program)?;
+                return Ok((dir, file));
+            }
+            Err(e) => err = e,
+        }
+    }
+    Err(err)
+}
+
 /// Maximum seeds in one `--seeds` spec. Ranges are span-capped
 /// individually below, but without a total cap a long comma list (or many
 /// ranges) could exhaust memory before dedup.
 pub const MAX_SEEDS: usize = 1_000_000;
+
+/// Maximum parallel drive jobs. Each worker spawns whole JVMs; past a
+/// few hundred the machine thrashes rather than parallelizes.
+pub const MAX_JOBS: usize = 256;
 
 /// Parse a seed spec into a sorted, deduplicated seed list.
 pub fn parse_seeds(spec: &str) -> Result<Vec<i64>, String> {
@@ -85,7 +124,10 @@ pub fn parse_seeds(spec: &str) -> Result<Vec<i64>, String> {
         if part.is_empty() {
             continue;
         }
-        if let Ok(n) = part.parse::<i64>() {
+        // Tolerate inner spaces ("1 - 3"); errors still quote the
+        // original part.
+        let clean: String = part.chars().filter(|c| !c.is_whitespace()).collect();
+        if let Ok(n) = clean.parse::<i64>() {
             if out.len() >= MAX_SEEDS {
                 return Err(format!("too many seeds (max {MAX_SEEDS})"));
             }
@@ -94,11 +136,11 @@ pub fn parse_seeds(spec: &str) -> Result<Vec<i64>, String> {
         }
         // Range A-B, where either side may be negative: try every interior
         // '-' as the separator.
-        let bytes = part.as_bytes();
+        let bytes = clean.as_bytes();
         let mut parsed = false;
         for i in 1..bytes.len() {
             if bytes[i] == b'-'
-                && let (Ok(a), Ok(b)) = (part[..i].parse::<i64>(), part[i + 1..].parse::<i64>())
+                && let (Ok(a), Ok(b)) = (clean[..i].parse::<i64>(), clean[i + 1..].parse::<i64>())
             {
                 if a > b {
                     return Err(format!("invalid reversed range: {part}"));
@@ -140,6 +182,9 @@ pub struct RunOutcome {
     /// Terminating signal, when the child died by signal (Unix only;
     /// `exit` is `None` then, which used to print as `exited with None`).
     pub signal: Option<i32>,
+    /// True when either pipe exceeded [`CAP_BYTES`]: only the prefix is
+    /// kept and byte comparison is unreliable.
+    pub truncated: bool,
     /// Captured stdout, capped at 1 MiB.
     pub out: Vec<u8>,
     /// Captured stderr, capped at 1 MiB.
@@ -147,9 +192,10 @@ pub struct RunOutcome {
 }
 
 impl RunOutcome {
-    /// One-line status: `exit 0`, `signal 9`, `timeout`, `spawn error: …`.
+    /// One-line status: `exit 0`, `signal 9`, `timeout`, `spawn error: …`,
+    /// with ` (truncated)` when output hit the cap.
     pub fn status_text(&self) -> String {
-        if self.timed_out {
+        let base = if self.timed_out {
             "timeout".to_string()
         } else if let Some(e) = &self.spawn_error {
             format!("spawn error: {e}")
@@ -159,9 +205,19 @@ impl RunOutcome {
             format!("signal {s}")
         } else {
             "unknown status".to_string()
+        };
+        if self.truncated {
+            format!("{base} (truncated)")
+        } else {
+            base
         }
     }
 }
+
+/// Maximum captured bytes per pipe. Past the cap, output is drained and
+/// discarded — the read end is never closed early, since that would
+/// SIGPIPE-kill a still-writing child and corrupt its exit status.
+const CAP_BYTES: usize = 1 << 20;
 
 #[cfg(unix)]
 fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
@@ -174,23 +230,163 @@ fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
     None
 }
 
-/// Quote `path` for `sh -c`: single-quote it, escaping embedded
-/// quotes. Temp paths rarely need this, but a space in `TMPDIR` must not
-/// break runners or, worse, inject shell syntax.
-fn shell_quote(path: &Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+/// Quote a string for `sh -c`: single-quote it, escaping embedded
+/// quotes.
+#[cfg(not(unix))]
+fn shell_quote_str(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(unix)]
+fn push_quoted_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.push(b'\'');
+    for &b in bytes {
+        if b == b'\'' {
+            out.extend_from_slice(b"'\\''");
+        } else {
+            out.push(b);
+        }
+    }
+    out.push(b'\'');
+}
+
+/// Build the `sh -c` script, substituting `{}` with `file` (or appending
+/// the path when the template has no placeholder). The path is
+/// shell-quoted in both cases. Byte-based: non-UTF8 paths (a non-UTF8
+/// `TMPDIR`) pass through unmangled instead of turning into U+FFFD and
+/// spurious runner errors.
+#[cfg(unix)]
+fn build_script(cmd_template: &str, file: &Path) -> std::ffi::OsString {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let path = file.as_os_str().as_bytes();
+    let mut out = Vec::new();
+    if cmd_template.contains("{}") {
+        // Replace every placeholder, like str::replace.
+        let mut rest = cmd_template;
+        while let Some((head, tail)) = rest.split_once("{}") {
+            out.extend_from_slice(head.as_bytes());
+            push_quoted_bytes(&mut out, path);
+            rest = tail;
+        }
+        out.extend_from_slice(rest.as_bytes());
+    } else {
+        out.extend_from_slice(cmd_template.as_bytes());
+        out.push(b' ');
+        push_quoted_bytes(&mut out, path);
+    }
+    std::ffi::OsString::from_vec(out)
+}
+
+#[cfg(not(unix))]
+fn build_script(cmd_template: &str, file: &Path) -> String {
+    let quoted = shell_quote_str(&file.to_string_lossy());
+    if cmd_template.contains("{}") {
+        cmd_template.replace("{}", &quoted)
+    } else {
+        format!("{cmd_template} {quoted}")
+    }
+}
+
+/// Shared state for one pipe-drain thread.
+struct DrainState {
+    buf: Mutex<Vec<u8>>,
+    truncated: AtomicBool,
+    /// Set once gathering is over: the thread exits at the next slice
+    /// instead of blocking on a daemon-held pipe forever.
+    done: AtomicBool,
+    /// True when the thread reads interruptible slices and will therefore
+    /// observe `done` (safe to join); false in fallback mode (detached).
+    interruptible: AtomicBool,
+}
+
+impl DrainState {
+    fn new() -> Self {
+        Self {
+            buf: Mutex::new(Vec::new()),
+            truncated: AtomicBool::new(false),
+            done: AtomicBool::new(false),
+            interruptible: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Drain one pipe into shared state, keeping the first [`CAP_BYTES`] and
+/// discarding the rest. Never closes the read end early (that would
+/// SIGPIPE-kill a still-writing child). Reads nonblocking slices so the
+/// thread exits promptly once `done` is set, even when a daemon
+/// grandchild holds the pipe open forever.
+#[cfg(unix)]
+fn drain_pipe<R: std::io::Read + std::os::unix::io::AsRawFd>(
+    h: Option<R>,
+    state: std::sync::Arc<DrainState>,
+) {
+    let Some(mut h) = h else { return };
+    let fd = h.as_raw_fd();
+    // SAFETY: fcntl on our own open pipe fd only flips a status flag.
+    let nonblocking = unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
+    };
+    state.interruptible.store(nonblocking, Ordering::Relaxed);
+    let mut tmp = [0u8; 8192];
+    loop {
+        if state.done.load(Ordering::Relaxed) {
+            break;
+        }
+        match h.read(&mut tmp) {
+            Ok(0) => break, // EOF: all writers gone.
+            Ok(n) => {
+                let mut b = state.buf.lock().unwrap();
+                let room = CAP_BYTES.saturating_sub(b.len());
+                if room == 0 {
+                    state.truncated.store(true, Ordering::Relaxed);
+                    // Keep draining (discard): closing our read end
+                    // would SIGPIPE-kill a still-writing child.
+                } else {
+                    b.extend_from_slice(&tmp[..n.min(room)]);
+                    if n > room {
+                        state.truncated.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+            Err(e) if nonblocking && e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Non-unix fallback: blocking drain with discard past the cap. A
+/// daemon-held pipe can wedge the thread; only unix gets slices.
+#[cfg(not(unix))]
+fn drain_pipe<R: std::io::Read>(h: Option<R>, state: std::sync::Arc<DrainState>) {
+    let Some(mut h) = h else { return };
+    let mut tmp = [0u8; 8192];
+    loop {
+        match h.read(&mut tmp) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let mut b = state.buf.lock().unwrap();
+                let room = CAP_BYTES.saturating_sub(b.len());
+                if room == 0 {
+                    state.truncated.store(true, Ordering::Relaxed);
+                } else {
+                    b.extend_from_slice(&tmp[..n.min(room)]);
+                    if n > room {
+                        state.truncated.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Run `cmd_template` via `sh -c`, substituting `{}` with `file` (or
 /// appending the path when the template has no placeholder). The path is
 /// shell-quoted in both cases.
 pub fn run_command(cmd_template: &str, file: &Path, timeout: Duration) -> RunOutcome {
-    let quoted = shell_quote(file);
-    let script = if cmd_template.contains("{}") {
-        cmd_template.replace("{}", &quoted)
-    } else {
-        format!("{cmd_template} {quoted}")
-    };
+    let script = build_script(cmd_template, file);
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
         .arg(&script)
@@ -212,6 +408,7 @@ pub fn run_command(cmd_template: &str, file: &Path, timeout: Duration) -> RunOut
                 spawn_error: Some(e.to_string()),
                 exit: None,
                 signal: None,
+                truncated: false,
                 out: Vec::new(),
                 err: Vec::new(),
             };
@@ -222,52 +419,60 @@ pub fn run_command(cmd_template: &str, file: &Path, timeout: Duration) -> RunOut
     // buffers as they arrive, so output drained before an orphaned
     // grandchild wedges the pipes is still kept; completion is only a
     // grace-limited wait.
-    fn drain<R: std::io::Read>(h: Option<R>, buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
-        let Some(mut h) = h else { return };
-        let mut tmp = [0u8; 8192];
-        loop {
-            match h.read(&mut tmp) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let mut b = buf.lock().unwrap();
-                    let room = (1usize << 20).saturating_sub(b.len());
-                    if room == 0 {
-                        break;
-                    }
-                    b.extend_from_slice(&tmp[..n.min(room)]);
-                }
-            }
-        }
-    }
+    let out_state = std::sync::Arc::new(DrainState::new());
+    let err_state = std::sync::Arc::new(DrainState::new());
     let (out_tx, out_rx) = std::sync::mpsc::channel();
-    let out_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    std::thread::spawn({
+    let mut out_handle = Some(std::thread::spawn({
         let h = child.stdout.take();
-        let buf = out_buf.clone();
+        let state = out_state.clone();
         move || {
-            drain(h, buf);
+            drain_pipe(h, state);
             let _ = out_tx.send(());
         }
-    });
+    }));
     let (err_tx, err_rx) = std::sync::mpsc::channel();
-    let err_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    std::thread::spawn({
+    let mut err_handle = Some(std::thread::spawn({
         let h = child.stderr.take();
-        let buf = err_buf.clone();
+        let state = err_state.clone();
         move || {
-            drain(h, buf);
+            drain_pipe(h, state);
             let _ = err_tx.send(());
         }
-    });
+    }));
     // The error arm below returns early; gather output through this.
-    // Whatever arrived before the grace expires is kept.
-    let gather = |out_rx: std::sync::mpsc::Receiver<()>, err_rx: std::sync::mpsc::Receiver<()>| {
+    // Whatever arrived before the grace expires is kept. Both pipes
+    // wait concurrently (one 2s grace, not two in sequence), then drain
+    // threads are told to stop and joined when interruptible, so daemon
+    // grandchildren cannot leak threads for the life of the drive.
+    let mut gather = |out_rx: std::sync::mpsc::Receiver<()>,
+                      err_rx: std::sync::mpsc::Receiver<()>| {
         let grace = Duration::from_secs(2);
-        let _ = out_rx.recv_timeout(grace);
-        let _ = err_rx.recv_timeout(grace);
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                let _ = out_rx.recv_timeout(grace);
+            });
+            s.spawn(move || {
+                let _ = err_rx.recv_timeout(grace);
+            });
+        });
+        out_state.done.store(true, Ordering::Relaxed);
+        err_state.done.store(true, Ordering::Relaxed);
+        if out_state.interruptible.load(Ordering::Relaxed)
+            && let Some(h) = out_handle.take()
+        {
+            let _ = h.join();
+        }
+        if err_state.interruptible.load(Ordering::Relaxed)
+            && let Some(h) = err_handle.take()
+        {
+            let _ = h.join();
+        }
+        let truncated = out_state.truncated.load(Ordering::Relaxed)
+            || err_state.truncated.load(Ordering::Relaxed);
         (
-            out_buf.lock().unwrap().clone(),
-            err_buf.lock().unwrap().clone(),
+            out_state.buf.lock().unwrap().clone(),
+            err_state.buf.lock().unwrap().clone(),
+            truncated,
         )
     };
     // The standard library has no wait-with-timeout, so poll.
@@ -284,31 +489,48 @@ pub fn run_command(cmd_template: &str, file: &Path, timeout: Duration) -> RunOut
             }
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    kill_child(&mut child);
-                    timed_out = true;
+                    // Re-check: the child may have exited between the
+                    // last poll and the deadline; killing and
+                    // reporting a timeout then would discard a
+                    // completed run.
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            exit = status.code();
+                            signal = exit_signal(&status);
+                        }
+                        _ => {
+                            kill_child(&mut child);
+                            timed_out = true;
+                        }
+                    }
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
             Err(e) => {
-                let (out, err) = gather(out_rx, err_rx);
+                // Best effort: never leave a possibly-running child
+                // behind just because status collection failed.
+                kill_child(&mut child);
+                let (out, err, truncated) = gather(out_rx, err_rx);
                 return RunOutcome {
                     timed_out: false,
                     spawn_error: Some(e.to_string()),
                     exit: None,
                     signal: None,
+                    truncated,
                     out,
                     err,
                 };
             }
         }
     }
-    let (out, err) = gather(out_rx, err_rx);
+    let (out, err, truncated) = gather(out_rx, err_rx);
     RunOutcome {
         timed_out,
         spawn_error: None,
         exit,
         signal,
+        truncated,
         out,
         err,
     }
@@ -355,6 +577,16 @@ struct SeedResult {
     outcomes: Vec<RunOutcome>,
 }
 
+/// Classify a caught generator panic: an expired generation deadline
+/// is a timeout, anything else is a generator bug.
+fn panic_detail(payload: Box<dyn std::any::Any + Send>) -> String {
+    if payload.is::<crate::gen_expr::GenTimeout>() {
+        "generation timed out".to_string()
+    } else {
+        "generator panicked".to_string()
+    }
+}
+
 fn run_seed(
     gopts: &GenerateOptions,
     runners: &[String],
@@ -366,11 +598,11 @@ fn run_seed(
     let prog =
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gen_program(gopts, seed))) {
             Ok(p) => p,
-            Err(_) => {
+            Err(payload) => {
                 return SeedResult {
                     seed,
                     status: Status::Error,
-                    detail: "generator panicked".to_string(),
+                    detail: panic_detail(payload),
                     threw_on_all: false,
                     program: String::new(),
                     outcomes: Vec::new(),
@@ -379,26 +611,19 @@ fn run_seed(
         };
     let program = emit_program(&prog, gopts);
 
-    let dir = std::env::temp_dir().join(format!(
-        "clojure-smith-{}-{seed}-{}",
-        std::process::id(),
-        unique_tag()
-    ));
-    let file = dir.join("prog.clj");
-    if let Err(e) = (|| -> std::io::Result<()> {
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(&file, &program)
-    })() {
-        return SeedResult {
-            seed,
-            status: Status::Error,
-            detail: format!("cannot stage program file: {e}"),
-            threw_on_all: false,
-            program,
-            outcomes: Vec::new(),
-        };
-    }
+    let (dir, file) = match stage_program(seed, &program) {
+        Ok(pair) => pair,
+        Err(e) => {
+            return SeedResult {
+                seed,
+                status: Status::Error,
+                detail: format!("cannot stage program file: {e}"),
+                threw_on_all: false,
+                program,
+                outcomes: Vec::new(),
+            };
+        }
+    };
 
     let outcomes: Vec<RunOutcome> = runners
         .iter()
@@ -438,10 +663,37 @@ fn run_seed(
                 outcomes,
             };
         }
+        // Only prefixes were captured: comparing them could equate
+        // outputs whose tails differ.
+        if o.truncated {
+            return SeedResult {
+                seed,
+                status: Status::Error,
+                detail: format!("runner {i} output exceeded 1MiB (comparison unreliable)"),
+                threw_on_all: false,
+                program,
+                outcomes,
+            };
+        }
     }
     let threw_on_all =
         !outcomes.is_empty() && outcomes.iter().all(|o| o.out.starts_with(b"threw:"));
-    if outcomes.windows(2).all(|w| w[0].out == w[1].out) {
+    // Safe math promises totality, so every runner throwing the SAME
+    // thing is a generator bug: save and count it as an error rather
+    // than a quiet OK. Under --no-safe-math, raw throws are expected
+    // (warn only), and differing throws are still a MISMATCH.
+    let agree = outcomes.windows(2).all(|w| w[0].out == w[1].out);
+    if threw_on_all && agree && !gopts.no_safe_math {
+        return SeedResult {
+            seed,
+            status: Status::Error,
+            detail: "all runners threw (totality hole under safe math?)".to_string(),
+            threw_on_all,
+            program,
+            outcomes,
+        };
+    }
+    if agree {
         SeedResult {
             seed,
             status: Status::Ok,
@@ -503,6 +755,10 @@ pub fn run_drive(opts: &DriveOptions) -> i32 {
         eprintln!("clojure-smith drive: --jobs must be at least 1");
         return 2;
     }
+    if opts.jobs > MAX_JOBS {
+        eprintln!("clojure-smith drive: --jobs cannot exceed {MAX_JOBS}");
+        return 2;
+    }
     if opts.timeout == 0 {
         eprintln!("clojure-smith drive: --timeout must be at least 1 second");
         return 2;
@@ -535,6 +791,9 @@ pub fn run_drive(opts: &DriveOptions) -> i32 {
     }
     let runners = opts.runners();
     let timeout = Duration::from_secs(opts.timeout);
+    // Generation shares the per-seed time budget: hostile options fail
+    // the seed via GenTimeout instead of stalling a worker.
+    gopts.gen_timeout = Some(timeout);
 
     if !opts.quiet {
         eprintln!(
@@ -596,6 +855,20 @@ pub fn run_drive(opts: &DriveOptions) -> i32 {
             Status::Mismatch => {
                 mismatches += 1;
                 eprintln!("seed {}: MISMATCH", r.seed);
+                if opts.show_outputs {
+                    for (i, o) in r.outcomes.iter().enumerate() {
+                        let text = String::from_utf8_lossy(&o.out);
+                        let shown = text.chars().take(4096).collect::<String>();
+                        eprintln!(
+                            "  runner {i} stdout: {shown}{}",
+                            if text.len() > shown.len() {
+                                "…[capped]"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
+                }
                 save_failure_report(&opts.fail_dir, r);
             }
             Status::Error => {
@@ -637,6 +910,8 @@ mod tests {
         // Two individually fine ranges exceed the total cap.
         assert!(parse_seeds("0-600000,1000000-1600000").is_err());
         assert_eq!(parse_seeds("0-999999").unwrap().len(), MAX_SEEDS);
+        // Inner spaces are tolerated.
+        assert_eq!(parse_seeds("1 - 3, 7").unwrap(), vec![1, 2, 3, 7]);
     }
 
     #[cfg(unix)]
@@ -690,6 +965,7 @@ mod tests {
             timeout: 30,
             fail_dir: dir.join("failures"),
             jobs: 2,
+            show_outputs: false,
             quiet: true,
             gen_opts: vec!["--max-funcs".to_string(), "2".to_string()],
         };
@@ -709,6 +985,7 @@ mod tests {
             timeout: 30,
             fail_dir: dir.join("failures"),
             jobs: 1,
+            show_outputs: false,
             quiet: true,
             gen_opts: vec![],
         };
@@ -731,6 +1008,7 @@ mod tests {
             timeout: 30,
             fail_dir,
             jobs: 1,
+            show_outputs: false,
             quiet: true,
             gen_opts: vec![],
         };
@@ -760,6 +1038,7 @@ mod tests {
             timeout: 30,
             fail_dir: dir.join("failures"),
             jobs: 1,
+            show_outputs: false,
             quiet: true,
             gen_opts: vec![],
         };
@@ -770,6 +1049,149 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn drive_all_threw_is_error_under_safe_math() {
+        // Safe math promises totality: every runner throwing means a
+        // generator bug, saved and counted as an error. Under
+        // --no-safe-math, throws are expected and the seed stays OK.
+        let dir =
+            std::env::temp_dir().join(format!("cs-threw-{}-{}", std::process::id(), unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mk = |gen_opts: Vec<String>, fail: &str| DriveOptions {
+            seeds: "5".to_string(),
+            runner: vec![
+                "echo threw: boom".to_string(),
+                "echo threw: boom".to_string(),
+            ],
+            timeout: 30,
+            fail_dir: dir.join(fail),
+            jobs: 1,
+            show_outputs: false,
+            quiet: true,
+            gen_opts,
+        };
+        assert_eq!(run_drive(&mk(vec![], "safe")), 3);
+        assert!(dir.join("safe/seed-5/prog.clj").exists());
+        assert_eq!(run_drive(&mk(vec!["--no-safe-math".to_string()], "raw")), 0);
+        assert!(!dir.join("raw/seed-5").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verbose_child_is_truncated_not_killed() {
+        // >1MiB of output must not SIGPIPE-kill the child: the exit
+        // status stays valid and the first 1MiB is kept with a flag.
+        let dir =
+            std::env::temp_dir().join(format!("cs-verb-{}-{}", std::process::id(), unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "x").unwrap();
+        let o = run_command("seq 1 300000 #{}", &file, Duration::from_secs(30));
+        assert_eq!(o.exit, Some(0));
+        assert!(o.truncated);
+        assert_eq!(o.out.len(), 1 << 20);
+        assert!(o.out.starts_with(b"1\n2\n3\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn jobs_over_cap_is_usage_error() {
+        let dir =
+            std::env::temp_dir().join(format!("cs-jobs-{}-{}", std::process::id(), unique_tag()));
+        let opts = DriveOptions {
+            seeds: "1".to_string(),
+            runner: vec!["true".to_string()],
+            timeout: 30,
+            fail_dir: dir,
+            jobs: MAX_JOBS + 1,
+            show_outputs: false,
+            quiet: true,
+            gen_opts: vec![],
+        };
+        assert_eq!(run_drive(&opts), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drive_timeout_runner_is_error_not_hang() {
+        // Full drive against a runner that outlives the timeout: the seed
+        // must come back Error (exit 3), and the 1s timeout must bound the
+        // run instead of waiting out the 30s sleep. The trailing `#`
+        // swallows the appended program path in a shell comment.
+        let dir =
+            std::env::temp_dir().join(format!("cs-to-{}-{}", std::process::id(), unique_tag()));
+        let opts = DriveOptions {
+            seeds: "5".to_string(),
+            runner: vec!["sleep 30 #".to_string()],
+            timeout: 1,
+            fail_dir: dir.clone(),
+            jobs: 1,
+            show_outputs: false,
+            quiet: true,
+            gen_opts: Vec::new(),
+        };
+        let start = std::time::Instant::now();
+        assert_eq!(run_drive(&opts), 3);
+        assert!(
+            start.elapsed() < Duration::from_secs(25),
+            "drive waited out the sleeper"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quick_commands_never_report_timeout() {
+        // Regression net for the timeout/exit race: a fast child must
+        // never come back timed out, repeatedly.
+        let dir =
+            std::env::temp_dir().join(format!("cs-race-{}-{}", std::process::id(), unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "x").unwrap();
+        for _ in 0..30 {
+            let o = run_command("echo hi #{}", &file, Duration::from_secs(5));
+            assert!(!o.timed_out);
+            assert_eq!(o.exit, Some(0));
+            assert_eq!(o.out, b"hi\n");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_pass_through() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir =
+            std::env::temp_dir().join(format!("cs-uni-{}-{}", std::process::id(), unique_tag()));
+        let mut raw = dir.as_os_str().as_encoded_bytes().to_vec();
+        raw.extend_from_slice(b"-\xff-dir");
+        let dir = std::path::PathBuf::from(std::ffi::OsString::from_vec(raw));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "bytes\n").unwrap();
+        // Lossy quoting would turn \xff into U+FFFD and `cat` would fail.
+        let o = run_command("cat {}", &file, Duration::from_secs(10));
+        assert_eq!(o.exit, Some(0));
+        assert_eq!(o.out, b"bytes\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn panic_detail_distinguishes_timeout() {
+        use crate::gen_expr::GenTimeout;
+        let timeout =
+            std::panic::catch_unwind(|| std::panic::panic_any(GenTimeout)).expect_err("must panic");
+        assert_eq!(panic_detail(timeout), "generation timed out");
+        let bug = std::panic::catch_unwind(|| panic!("boom")).expect_err("must panic");
+        assert_eq!(panic_detail(bug), "generator panicked");
+    }
+
     #[test]
     fn status_texts() {
         let base = RunOutcome {
@@ -777,6 +1199,7 @@ mod tests {
             spawn_error: None,
             exit: None,
             signal: None,
+            truncated: false,
             out: Vec::new(),
             err: Vec::new(),
         };
@@ -811,6 +1234,15 @@ mod tests {
             }
             .status_text(),
             "spawn error: nope"
+        );
+        assert_eq!(
+            RunOutcome {
+                exit: Some(0),
+                truncated: true,
+                ..base.clone()
+            }
+            .status_text(),
+            "exit 0 (truncated)"
         );
     }
 

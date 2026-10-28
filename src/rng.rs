@@ -74,7 +74,17 @@ impl Rng {
 
     /// Uniform value in `[lo, hi]` inclusive over `usize`.
     pub fn range_usize(&mut self, lo: usize, hi: usize) -> usize {
-        self.range(lo as i64, hi as i64) as usize
+        assert!(lo <= hi, "range_usize: lo ({lo}) > hi ({hi})");
+        if lo == hi {
+            return lo;
+        }
+        // Lemire's method over the full usize span (a detour through
+        // i64 would wrap values above i64::MAX). The span reaches 2^64
+        // at most, so x * span always fits u128 exactly.
+        let span = hi as u128 - lo as u128 + 1;
+        let x = self.next_u64() as u128;
+        let r = (x.wrapping_mul(span) >> 64) as usize;
+        lo.wrapping_add(r)
     }
 
     /// True with probability `p`, which must lie in `[0.0, 1.0]`.
@@ -101,7 +111,12 @@ impl Rng {
     pub fn pick_index_weighted(&mut self, weights: &[u64]) -> usize {
         let total: u128 = weights.iter().map(|&w| w as u128).sum();
         assert!(total > 0, "pick_index_weighted: no positive weight");
-        let mut r = (self.next_u64() as u128 * total) >> 64;
+        // Split multiplication: the total can exceed 2^64 (many huge
+        // weights), where a naive next*total would overflow u128. With
+        // total = hi*2^64 + lo: (a*total)>>64 = a*hi + (a*lo)>>64, each
+        // term exact (a <= 2^64-1; the total fits u128 by slice length).
+        let a = self.next_u64() as u128;
+        let mut r = a * (total >> 64) + ((a * (total & u64::MAX as u128)) >> 64);
         // r lies in [0, total), so some bucket must catch it.
         for (i, &w) in weights.iter().enumerate() {
             let w = w as u128;
@@ -258,5 +273,41 @@ mod tests {
         assert!(caught(&mut || {
             Rng::new(5).pick_index_weighted(&[0, 0]);
         }));
+    }
+
+    #[test]
+    fn huge_weights_do_not_overflow() {
+        // total exceeds 2^64: a naive next*total overflows u128.
+        let mut rng = Rng::new(21);
+        let mut seen = [0u32; 2];
+        for _ in 0..200 {
+            let i = rng.pick_index_weighted(&[u64::MAX, u64::MAX]);
+            seen[i] += 1;
+        }
+        assert!(seen[0] > 50 && seen[1] > 50, "{seen:?}");
+        // Skewed huge weights still favor the heavy bucket.
+        let mut rng = Rng::new(22);
+        let mut heavy = 0;
+        for _ in 0..200 {
+            if rng.pick_index_weighted(&[u64::MAX, 1]) == 0 {
+                heavy += 1;
+            }
+        }
+        assert!(heavy > 150, "heavy={heavy}");
+    }
+
+    #[test]
+    fn range_usize_covers_full_span() {
+        // Values above i64::MAX must not wrap through `as i64`.
+        let mut rng = Rng::new(23);
+        for _ in 0..200 {
+            let v = rng.range_usize(usize::MAX - 10, usize::MAX);
+            assert!((usize::MAX - 10..=usize::MAX).contains(&v));
+        }
+        let mut rng = Rng::new(24);
+        for _ in 0..200 {
+            let v = rng.range_usize(0, usize::MAX);
+            let _ = v;
+        }
     }
 }
