@@ -28,6 +28,10 @@ pub struct FuncSig {
     /// through the functions it calls. Used to keep atoms out of their own
     /// `swap!` retry context (which would retry forever).
     pub writes: Vec<String>,
+    /// Static work cost of one constrained evaluation of the body: every
+    /// generated node plus charged calls and trip multipliers, but
+    /// excluding self-recursion expansion (callers multiply by `2^fuel`).
+    pub body_cost: u64,
 }
 
 /// Direct-recursion context. Installed only inside the `(pos? fuel)`
@@ -74,6 +78,12 @@ pub struct Ctx<'a> {
     pub in_loop: u32,
     /// Static self-call sites generated in the current function (budget).
     pub self_sites: u32,
+    /// Work units spent by the function currently generated, against
+    /// `budget`. Every node, call, and trip multiplier is charged here as
+    /// it is generated; the final total becomes the function's `body_cost`.
+    pub spent: u64,
+    /// Work budget for the function currently generated.
+    pub budget: u64,
 }
 
 impl<'a> Ctx<'a> {
@@ -94,12 +104,30 @@ impl<'a> Ctx<'a> {
             called: HashSet::new(),
             in_loop: 0,
             self_sites: 0,
+            spent: 0,
+            budget: crate::cost::WORK_BUDGET_PER_FUNC,
         }
     }
 
     /// True when writing any of `writes` is currently forbidden.
     pub fn writes_forbidden(&self, writes: &[String]) -> bool {
         writes.iter().any(|w| self.swap_forbidden.contains(w))
+    }
+
+    /// Charge `n` work units against the current budget (saturating).
+    pub fn charge(&mut self, n: u64) {
+        self.spent = self.spent.saturating_add(n);
+    }
+
+    /// Work units still available.
+    pub fn remaining(&self) -> u64 {
+        self.budget.saturating_sub(self.spent)
+    }
+
+    /// True when a call to `sig` fits in the remaining budget at fuel
+    /// zero (recursive calls shrink their drawn fuel to fit from there).
+    pub fn call_affordable(&self, sig: &FuncSig) -> bool {
+        sig.body_cost <= self.remaining()
     }
 
     /// A globally fresh name.
@@ -144,7 +172,7 @@ impl<'a> Ctx<'a> {
             .env
             .funcs
             .iter()
-            .filter(|f| &f.ret == t && !self.writes_forbidden(&f.writes))
+            .filter(|f| &f.ret == t && !self.writes_forbidden(&f.writes) && self.call_affordable(f))
             .cloned()
             .collect();
         if allow_self
@@ -162,6 +190,9 @@ impl<'a> Ctx<'a> {
                 // Never consulted: self is excluded wherever write
                 // sets matter (see above).
                 writes: Vec::new(),
+                // Never charged: self sites cost a unit at emission and
+                // their expansion is paid by callers via fuel.
+                body_cost: 0,
             });
         }
         out
@@ -248,6 +279,7 @@ fn pick_kind(ctx: &mut Ctx, kinds: &[(u64, u8)]) -> u8 {
 /// Generate a form of type `t`.
 pub fn gen_expr(ctx: &mut Ctx, t: &ValType) -> Form {
     ctx.exprs += 1;
+    ctx.charge(1);
     if ctx.depth == 0 {
         return gen_leaf(ctx, t);
     }
@@ -307,6 +339,7 @@ pub fn gen_body(ctx: &mut Ctx, t: &ValType, max_stmts: u32) -> Vec<Form> {
 pub fn gen_stmt(ctx: &mut Ctx) -> Form {
     // Tags: 0 expr, 1 swap!, 2 reset!, 3 compare-and-set!, 4 call,
     // 5 dotimes, 6 doseq.
+    ctx.charge(1);
     let no_loops = ctx.opts.no_loops;
     let has_writable = !writable_globals(ctx).is_empty();
     let has_funcs = !stmt_call_cands(ctx).is_empty();
@@ -354,7 +387,9 @@ fn gen_leaf(ctx: &mut Ctx, t: &ValType) -> Form {
         let i = ctx.rng.below(vars.len());
         vars.swap_remove(i)
     } else {
-        gen_literal(ctx.rng, ctx.opts, &ctx.env.records, t)
+        let (lit, cost) = gen_literal(ctx.rng, ctx.opts, &ctx.env.records, t);
+        ctx.charge(cost);
+        lit
     }
 }
 
@@ -398,6 +433,7 @@ fn gen_loop(ctx: &mut Ctx, t: &ValType) -> Form {
         ctx.in_loop += 1;
         let max_iters = ctx.opts.max_loop_iters as i64;
         let no_safe_math = ctx.opts.no_safe_math;
+        let before = ctx.spent;
         let init = gen_expr(ctx, t);
         let mark = ctx.env.locals.len();
         ctx.env.locals.push(("i".to_string(), ValType::Long));
@@ -413,7 +449,16 @@ fn gen_loop(ctx: &mut Ctx, t: &ValType) -> Form {
         } else {
             max_iters
         };
-        let iters = ctx.rng.range(0, cap);
+        // Shrink trips to fit the remaining budget: the body was charged
+        // once during generation, and each further trip pays again.
+        let per_trip = ctx.spent.saturating_sub(before).max(1);
+        let drawn = ctx.rng.range(0, cap);
+        let iters = crate::cost::shrink_trips(drawn, per_trip, ctx.remaining());
+        ctx.charge(
+            (iters.max(0) as u64)
+                .saturating_sub(1)
+                .saturating_mul(per_trip),
+        );
         let inc = if no_safe_math { "inc" } else { "s-inc" };
         // The `identity` wrappers keep both bindings boxed (Object-typed):
         // a bare boolean (or long) literal init would make the loop binding
@@ -478,6 +523,7 @@ fn has_threadable(ctx: &Ctx, t: &ValType) -> bool {
             && !f.recursive
             && !f.params.is_empty()
             && !ctx.writes_forbidden(&f.writes)
+            && ctx.call_affordable(f)
             && self_name != Some(f.name.as_str())
     })
 }
@@ -498,6 +544,7 @@ fn thread_expr(ctx: &mut Ctx, t: &ValType, steps: usize) -> Form {
                 && !f.recursive
                 && !f.params.is_empty()
                 && !ctx.writes_forbidden(&f.writes)
+                && ctx.call_affordable(f)
                 && self_name.as_ref() != Some(&f.name)
         })
         .cloned()
@@ -507,6 +554,9 @@ fn thread_expr(ctx: &mut Ctx, t: &ValType, steps: usize) -> Form {
     }
     let f = cands[ctx.rng.below(cands.len())].clone();
     ctx.called.insert(f.name.clone());
+    // Reserve the step price before generating the subexpression and the
+    // remaining arguments (threaded functions are never recursive).
+    ctx.charge(f.body_cost);
     nested(ctx, 1, 0, |ctx| {
         let sub = if steps > 1 && ctx.rng.chance(0.5) {
             thread_expr(ctx, &f.params[0], steps - 1)
@@ -522,7 +572,9 @@ fn thread_expr(ctx: &mut Ctx, t: &ValType, steps: usize) -> Form {
 }
 
 /// Generate a call to `sig`, handling recursion fuel: outer calls pass a
-/// small constant, self calls pass the decremented fuel variable.
+/// small constant, self calls pass the decremented fuel variable. The
+/// call price (body times `2^fuel` for recursive callees) is reserved up
+/// front from what remains; recursive fuel shrinks to fit.
 fn gen_call_sig(ctx: &mut Ctx, sig: &FuncSig) -> Form {
     let is_self = ctx
         .self_call
@@ -538,6 +590,21 @@ fn gen_call_sig(ctx: &mut Ctx, sig: &FuncSig) -> Form {
     }
     let no_safe_math = ctx.opts.no_safe_math;
     let max_fuel = ctx.opts.max_recursion_depth as i64;
+    let fuel = if is_self || !sig.recursive {
+        None
+    } else {
+        let drawn = ctx.rng.range(0, max_fuel).max(0) as u64;
+        // Candidates were filtered affordable, so fuel zero always fits;
+        // shrink the draw from there (fail closed on a logic slip).
+        let k_max = crate::cost::max_fuel_for(sig.body_cost, ctx.remaining()).unwrap_or(0);
+        Some(drawn.min(k_max) as i64)
+    };
+    let price = match fuel {
+        Some(k) => crate::cost::call_charge(sig.body_cost, true, k.max(0) as u64),
+        None if is_self => 1,
+        None => sig.body_cost,
+    };
+    ctx.charge(price);
     nested(ctx, 1, 0, |ctx| {
         let mut args = Vec::with_capacity(sig.params.len());
         for (i, pt) in sig.params.iter().enumerate() {
@@ -547,7 +614,7 @@ fn gen_call_sig(ctx: &mut Ctx, sig: &FuncSig) -> Form {
                     let dec = if no_safe_math { "dec" } else { "s-dec" };
                     args.push(Form::call(dec, vec![Form::sym(fuel)]));
                 } else {
-                    args.push(Form::int(ctx.rng.range(0, max_fuel)));
+                    args.push(Form::int(fuel.unwrap_or(0)));
                 }
             } else {
                 args.push(gen_expr(ctx, pt));
@@ -588,7 +655,7 @@ fn stmt_call_cands(ctx: &Ctx) -> Vec<FuncSig> {
         .env
         .funcs
         .iter()
-        .filter(|f| !ctx.writes_forbidden(&f.writes))
+        .filter(|f| !ctx.writes_forbidden(&f.writes) && ctx.call_affordable(f))
         .cloned()
         .collect();
     if ctx.swap_forbidden.is_empty()
@@ -602,6 +669,8 @@ fn stmt_call_cands(ctx: &Ctx) -> Vec<FuncSig> {
             ret: s.ret.clone(),
             recursive: true,
             writes: Vec::new(),
+            // Never charged: see the sibling self entry above.
+            body_cost: 0,
         });
     }
     cands
@@ -665,6 +734,7 @@ fn gen_dotimes(ctx: &mut Ctx) -> Form {
         let max_iters = ctx.opts.max_loop_iters as i64;
         let k = ctx.rng.range_usize(1, 3);
         ctx.in_loop += 1;
+        let before = ctx.spent;
         let body = with_locals(ctx, vec![("i".to_string(), ValType::Long)], |ctx| {
             let mut body = Vec::with_capacity(k);
             for _ in 0..k {
@@ -679,7 +749,11 @@ fn gen_dotimes(ctx: &mut Ctx) -> Form {
         } else {
             max_iters
         };
-        let n = ctx.rng.range(0, cap);
+        // Shrink trips to fit the remaining budget (see gen_loop).
+        let per_trip = ctx.spent.saturating_sub(before).max(1);
+        let drawn = ctx.rng.range(0, cap);
+        let n = crate::cost::shrink_trips(drawn, per_trip, ctx.remaining());
+        ctx.charge((n.max(0) as u64).saturating_sub(1).saturating_mul(per_trip));
         let mut form = vec![
             Form::sym("dotimes"),
             Form::vector(vec![Form::sym("i"), Form::int(n)]),
@@ -704,6 +778,7 @@ fn gen_doseq(ctx: &mut Ctx) -> Form {
             bound.push((name, et));
         }
         let k = ctx.rng.range_usize(1, 3);
+        let before = ctx.spent;
         let body = with_locals(ctx, bound, |ctx| {
             let mut body = Vec::with_capacity(k);
             for _ in 0..k {
@@ -712,14 +787,21 @@ fn gen_doseq(ctx: &mut Ctx) -> Form {
             body
         });
         ctx.in_loop -= 1;
-        if body.iter().any(|f| form_has_call(f, &ctx.env.funcs)) {
-            // Cap trips by bounding the collections (raw `take` with a
-            // small constant is total).
-            for i in (1..flat.len()).step_by(2) {
-                let coll = std::mem::replace(&mut flat[i], Form::nil());
-                flat[i] = Form::call("take", vec![Form::int(MAX_CALL_LOOP_TRIPS), coll]);
-            }
+        // Bound cartesian trips by the remaining budget (raw `take` with a
+        // small constant is total), keeping the tighter trip cap when the
+        // body calls user functions.
+        let has_calls = body.iter().any(|f| form_has_call(f, &ctx.env.funcs));
+        let per_trip = ctx.spent.saturating_sub(before).max(1);
+        let mut k_take = crate::cost::take_k(n, per_trip, ctx.remaining());
+        if has_calls {
+            k_take = k_take.min(MAX_CALL_LOOP_TRIPS);
         }
+        for i in (1..flat.len()).step_by(2) {
+            let coll = std::mem::replace(&mut flat[i], Form::nil());
+            flat[i] = Form::call("take", vec![Form::int(k_take), coll]);
+        }
+        let trips = (k_take.max(0) as u64).saturating_pow(n as u32);
+        ctx.charge(trips.saturating_sub(1).saturating_mul(per_trip));
         let mut form = vec![Form::sym("doseq"), Form::vector(flat)];
         form.extend(body);
         Form::list(form)
@@ -811,6 +893,7 @@ fn reduce_cands(ctx: &Ctx, t: &ValType) -> Vec<FuncSig> {
             !f.recursive
                 && self_name != Some(f.name.as_str())
                 && !ctx.writes_forbidden(&f.writes)
+                && ctx.call_affordable(f)
                 && f.params.len() == 2
                 && &f.params[0] == t
                 && &f.ret == t
@@ -829,6 +912,10 @@ fn gen_reduce(ctx: &mut Ctx, t: &ValType) -> Form {
     nested(ctx, 1, 0, |ctx| {
         let init = gen_expr(ctx, t);
         let coll = gen_expr(ctx, &ValType::Vec(Box::new(f.params[1].clone())));
+        // Cap applications by the remaining budget (see the mapv arm).
+        let k = crate::cost::take_k(1, f.body_cost.max(1), ctx.remaining());
+        ctx.charge((k.max(0) as u64).saturating_mul(f.body_cost));
+        let coll = Form::call("take", vec![Form::int(k), coll]);
         Form::call("reduce", vec![Form::sym(f.name.clone()), init, coll])
     })
 }
@@ -1270,7 +1357,8 @@ fn gen_str_pred(ctx: &mut Ctx) -> Form {
                 // on the default locale and would be nondeterministic.
                 let op = ["str/includes?", "str/starts-with?", "str/ends-with?"][n - 1];
                 let a = gen_expr(ctx, &ValType::Str);
-                let b = gen_literal(ctx.rng, ctx.opts, &ctx.env.records, &ValType::Str);
+                let (b, bcost) = gen_literal(ctx.rng, ctx.opts, &ctx.env.records, &ValType::Str);
+                ctx.charge(bcost);
                 Form::call(op, vec![a, b])
             }
         }
@@ -1314,7 +1402,8 @@ fn gen_str_op(ctx: &mut Ctx) -> Form {
             Form::call("s-subs", vec![s, a, b])
         }),
         2 => nested(ctx, 1, 0, |ctx| {
-            let sep = gen_literal(ctx.rng, ctx.opts, &ctx.env.records, &ValType::Str);
+            let (sep, scost) = gen_literal(ctx.rng, ctx.opts, &ctx.env.records, &ValType::Str);
+            ctx.charge(scost);
             let coll = gen_expr(ctx, &ValType::Vec(Box::new(ValType::Str)));
             Form::call("str/join", vec![sep, coll])
         }),
@@ -1355,6 +1444,7 @@ fn mapv_cands(ctx: &Ctx, e: &ValType) -> Vec<FuncSig> {
             !f.recursive
                 && self_name != Some(f.name.as_str())
                 && !ctx.writes_forbidden(&f.writes)
+                && ctx.call_affordable(f)
                 && f.params.len() == 1
                 && &f.ret == e
         })
@@ -1371,6 +1461,7 @@ fn filterv_cands(ctx: &Ctx, e: &ValType) -> Vec<FuncSig> {
             !f.recursive
                 && self_name != Some(f.name.as_str())
                 && !ctx.writes_forbidden(&f.writes)
+                && ctx.call_affordable(f)
                 && f.params.len() == 1
                 && &f.params[0] == e
                 && f.ret == ValType::Bool
@@ -1473,6 +1564,11 @@ fn gen_vec_op(ctx: &mut Ctx, e: &ValType) -> Form {
             ctx.called.insert(f.name.clone());
             nested(ctx, 1, 0, |ctx| {
                 let coll = gen_expr(ctx, &ValType::Vec(Box::new(f.params[0].clone())));
+                // Cap applications by the remaining budget (take zero is
+                // valid: an empty result).
+                let k = crate::cost::take_k(1, f.body_cost.max(1), ctx.remaining());
+                ctx.charge((k.max(0) as u64).saturating_mul(f.body_cost));
+                let coll = Form::call("take", vec![Form::int(k), coll]);
                 Form::call("mapv", vec![Form::sym(f.name.clone()), coll])
             })
         }
@@ -1483,6 +1579,9 @@ fn gen_vec_op(ctx: &mut Ctx, e: &ValType) -> Form {
             nested(ctx, 1, 0, |ctx| {
                 let t = ValType::Vec(Box::new(e.clone()));
                 let coll = gen_expr(ctx, &t);
+                let k = crate::cost::take_k(1, f.body_cost.max(1), ctx.remaining());
+                ctx.charge((k.max(0) as u64).saturating_mul(f.body_cost));
+                let coll = Form::call("take", vec![Form::int(k), coll]);
                 Form::call("filterv", vec![Form::sym(f.name.clone()), coll])
             })
         }
@@ -1518,6 +1617,7 @@ fn gen_for(ctx: &mut Ctx, e: &ValType) -> Form {
             bound.push((name, et));
         }
         let with_when = ctx.rng.chance(0.4);
+        let before = ctx.spent;
         let (body, cond) = with_locals(ctx, bound, |ctx| {
             let c = with_when.then(|| gen_expr(ctx, &ValType::Bool));
             let b = gen_expr(ctx, e);
@@ -1528,12 +1628,18 @@ fn gen_for(ctx: &mut Ctx, e: &ValType) -> Form {
             || cond
                 .as_ref()
                 .is_some_and(|c| form_has_call(c, &ctx.env.funcs));
+        // Bound cartesian trips by the remaining budget (see gen_doseq).
+        let per_trip = ctx.spent.saturating_sub(before).max(1);
+        let mut k_take = crate::cost::take_k(n, per_trip, ctx.remaining());
         if has_calls {
-            for i in (1..flat.len()).step_by(2) {
-                let coll = std::mem::replace(&mut flat[i], Form::nil());
-                flat[i] = Form::call("take", vec![Form::int(MAX_CALL_LOOP_TRIPS), coll]);
-            }
+            k_take = k_take.min(MAX_CALL_LOOP_TRIPS);
         }
+        for i in (1..flat.len()).step_by(2) {
+            let coll = std::mem::replace(&mut flat[i], Form::nil());
+            flat[i] = Form::call("take", vec![Form::int(k_take), coll]);
+        }
+        let trips = (k_take.max(0) as u64).saturating_pow(n as u32);
+        ctx.charge(trips.saturating_sub(1).saturating_mul(per_trip));
         if let Some(c) = cond {
             flat.push(Form::kw("when"));
             flat.push(c);

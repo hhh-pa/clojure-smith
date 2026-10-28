@@ -238,13 +238,14 @@ fn gen_string(rng: &mut Rng, max_len: usize) -> String {
 }
 
 /// A random literal form of type `t`.
+/// A random literal of type `t`, with its work cost (node count).
 pub fn gen_literal(
     rng: &mut Rng,
     opts: &GenerateOptions,
     records: &[RecordDef],
     t: &ValType,
-) -> Form {
-    match t {
+) -> (Form, u64) {
+    let form = match t {
         ValType::Long => Form::int(gen_long(rng)),
         ValType::Double => Form::float(gen_double(rng)),
         ValType::Bool => Form::boolean(rng.next_bool()),
@@ -253,7 +254,7 @@ pub fn gen_literal(
             let n = rng.below(opts.max_vector_len as usize + 1);
             Form::vector(
                 (0..n)
-                    .map(|_| gen_literal(rng, opts, records, elem))
+                    .map(|_| gen_literal(rng, opts, records, elem).0)
                     .collect(),
             )
         }
@@ -264,7 +265,7 @@ pub fn gen_literal(
             Form::map(
                 keys.into_iter()
                     .take(n)
-                    .map(|k| (Form::kw(k), gen_literal(rng, opts, records, val)))
+                    .map(|k| (Form::kw(k), gen_literal(rng, opts, records, val).0))
                     .collect(),
             )
         }
@@ -274,11 +275,13 @@ pub fn gen_literal(
                 &r.ctor_name(),
                 r.fields
                     .iter()
-                    .map(|(_, ft)| gen_literal(rng, opts, records, ft))
+                    .map(|(_, ft)| gen_literal(rng, opts, records, ft).0)
                     .collect(),
             )
         }
-    }
+    };
+    let cost = form.size() as u64;
+    (form, cost)
 }
 
 /// A deterministic default value of type `t`, for total accessors.
@@ -342,13 +345,13 @@ mod tests {
         let mut rng = Rng::new(2);
         let mut seen = std::collections::HashSet::new();
         for _ in 0..50 {
-            let lit = gen_literal(&mut rng, &o, &[], &ValType::Long);
+            let lit = gen_literal(&mut rng, &o, &[], &ValType::Long).0;
             seen.insert(print_compact(&lit));
         }
         assert!(seen.len() > 10, "long literals lack variety: {seen:?}");
         // Map literals stay within the key pool.
         for _ in 0..50 {
-            let lit = gen_literal(&mut rng, &o, &[], &ValType::Map(Box::new(ValType::Long)));
+            let lit = gen_literal(&mut rng, &o, &[], &ValType::Map(Box::new(ValType::Long))).0;
             if let Form::Map(pairs) = lit {
                 assert!(pairs.len() <= 4);
                 for (k, _) in &pairs {
@@ -374,7 +377,7 @@ mod tests {
                 ("f1".to_string(), ValType::Str),
             ],
         }];
-        let lit = gen_literal(&mut rng, &o, &records, &ValType::Record(0));
+        let lit = gen_literal(&mut rng, &o, &records, &ValType::Record(0)).0;
         let text = print_compact(&lit);
         assert!(text.starts_with("(->rec0 "), "{text}");
         assert_eq!(

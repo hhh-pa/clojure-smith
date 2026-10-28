@@ -1,3 +1,4 @@
+pub mod cost;
 pub mod driver;
 pub mod form;
 pub mod gen_expr;

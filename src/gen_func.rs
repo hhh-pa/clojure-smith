@@ -21,6 +21,7 @@ pub fn gen_func(ctx: &mut Ctx, idx: usize) -> GeneratedFunc {
     ctx.direct_writes.clear();
     ctx.called.clear();
     ctx.self_sites = 0;
+    ctx.spent = 0;
     let name = format!("f{idx}");
     let no_recursion = ctx.opts.no_recursion;
     let max_params = ctx.opts.max_params as usize;
@@ -81,6 +82,10 @@ pub fn gen_func(ctx: &mut Ctx, idx: usize) -> GeneratedFunc {
             ret,
             recursive,
             writes,
+            // Everything the body spent, excluding self-recursion
+            // expansion (self sites cost a unit each; callers multiply
+            // by 2^fuel for the real expansion).
+            body_cost: ctx.spent.max(1),
         },
     }
 }

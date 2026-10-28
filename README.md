@@ -171,6 +171,11 @@ Totality and determinism come from a set of deliberate rules:
   bounds; `while`, `cycle`, `repeat`, `iterate`, and unbounded `range` are
   never generated. Recursion is direct-only with a fuel parameter guarded by
   `(pos? fuel)`.
+- **Work budget**: each function spends from a fixed budget — calls cost
+  the callee's body cost (times `2^fuel` for recursive callees), loops
+  charge trips times body cost. Calls that do not fit are not generated;
+  fuel and trip counts shrink to fit instead. The entry point gets the sum
+  of body costs plus slack, so total runtime is bounded at any options.
 - **Terminating state updates**: an atom is never written inside its own
   `swap!` retry context — directly or transitively through called
   functions — which would otherwise retry forever. (Write sets are tracked

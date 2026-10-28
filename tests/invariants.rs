@@ -418,10 +418,12 @@ fn check_trips(forms: &[Form], user_funcs: &HashSet<String>, errors: &mut Vec<St
                     let rest: Vec<Form> = rest.into_iter().cloned().collect();
                     if body_has_call(&rest, user_funcs) {
                         for c in colls {
+                            // The work budget may shrink the cap below 3;
+                            // what matters is that trips stay bounded.
                             let capped = matches!(c,
                                 Form::List(fs)
                                 if fs.len() == 3 && sym(&fs[0]) == Some("take")
-                                && matches!(&fs[1], Form::Int(n) if *n == MAX_CALL_LOOP_TRIPS));
+                                && matches!(&fs[1], Form::Int(n) if (0..=MAX_CALL_LOOP_TRIPS).contains(n)));
                             if !capped {
                                 errors.push(format!("{head} with calls and uncapped coll"));
                             }
@@ -604,4 +606,168 @@ fn no_raw_division_under_safe_math() {
     }
     // Smoke check: s-div is actually emitted, so the ban is not vacuous.
     assert!(total_safe > 0, "no s-div generated in sweep");
+}
+
+// ---------------------------------------------------------------------------
+// Work budget structure: every trip multiplier and fuel value in generated
+// code is a shrunk literal, so the static cost model holds by construction:
+// doseq/for/mapv/filterv/reduce collections are always `(take K ...)` with
+// a literal K, loop trip counts are literals within max, fuel arguments are
+// literals within range, and self calls always pass decremented fuel.
+// ---------------------------------------------------------------------------
+
+/// True when `form` is `(take K ...)` with a literal non-negative `K`.
+fn is_take_cap(form: &Form) -> bool {
+    matches!(form,
+        Form::List(fs)
+        if fs.len() == 3 && sym(&fs[0]) == Some("take") && matches!(&fs[1], Form::Int(n) if *n >= 0))
+}
+
+/// (name, is_recursive) for user functions.
+fn user_sigs(forms: &[Form]) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    for f in forms {
+        if let Form::List(fs) = f
+            && fs.len() >= 4
+            && sym(&fs[0]) == Some("defn")
+            && let Some(name) = sym(&fs[1])
+            && name.starts_with('f')
+            && name[1..].chars().all(|c| c.is_ascii_digit())
+            && let Form::Vector(params) = &fs[2]
+        {
+            let rec = params.first().and_then(sym) == Some("fuel");
+            out.push((name.to_string(), rec));
+        }
+    }
+    out
+}
+
+fn check_body_budget(
+    name: &str,
+    body: &[Form],
+    sigs: &[(String, bool)],
+    max_iters: i64,
+    max_fuel: i64,
+    errors: &mut Vec<String>,
+) {
+    let is_user = |h: &str| sigs.iter().any(|(m, _)| m == h);
+    let is_rec = |h: &str| sigs.iter().any(|(m, r)| m == h && *r);
+    let mut stack: Vec<&Form> = body.iter().collect();
+    while let Some(f) = stack.pop() {
+        if let Form::List(fs) = f
+            && let Some(head) = fs.first().and_then(sym)
+        {
+            match head {
+                "doseq" | "for" if fs.len() >= 3 => {
+                    if let Form::Vector(flat) = &fs[1] {
+                        let mut i = 0;
+                        while i + 1 < flat.len() {
+                            if matches!(&flat[i], Form::Keyword(k) if k == "when") {
+                                break;
+                            }
+                            if !is_take_cap(&flat[i + 1]) {
+                                errors.push(format!("{name}: {head} coll is not (take K>=0 ...)"));
+                            }
+                            i += 2;
+                        }
+                    }
+                }
+                "mapv" | "filterv" if fs.len() == 3 => {
+                    if !is_take_cap(&fs[2]) {
+                        errors.push(format!("{name}: {head} coll is not (take K>=0 ...)"));
+                    }
+                }
+                "reduce" if fs.len() == 4 => {
+                    if !is_take_cap(&fs[3]) {
+                        errors.push(format!("{name}: reduce coll is not (take K>=0 ...)"));
+                    }
+                }
+                // (loop [i (identity 0) acc ..] (if (< i N) ..)): N in range.
+                "loop" if fs.len() == 3 => {
+                    let mut ok = false;
+                    if let Form::List(cond) = &fs[2]
+                        && cond.len() == 4
+                        && let Form::List(test) = &cond[1]
+                        && test.len() == 3
+                        && let Form::Int(n) = &test[2]
+                        && (0..=max_iters).contains(n)
+                    {
+                        ok = true;
+                    }
+                    if !ok {
+                        errors.push(format!("{name}: loop trips not a literal in range"));
+                    }
+                }
+                // (dotimes [i N] ..): N in range.
+                "dotimes" if fs.len() >= 3 => {
+                    let ok = matches!(&fs[1],
+                        Form::Vector(bind) if bind.len() == 2
+                        && matches!(&bind[1], Form::Int(n) if (0..=max_iters).contains(n)));
+                    if !ok {
+                        errors.push(format!("{name}: dotimes count not a literal in range"));
+                    }
+                }
+                h if is_user(h) && is_rec(h) => {
+                    let self_fuel = h == name
+                        && matches!(fs.get(1),
+                            Some(Form::List(d))
+                            if d.len() == 2
+                            && matches!(sym(&d[0]), Some("s-dec" | "dec"))
+                            && sym(&d[1]) == Some("fuel"));
+                    // Fuel draws are inclusive on both ends.
+                    let lit_fuel = matches!(fs.get(1),
+                        Some(Form::Int(k)) if (0..=max_fuel).contains(k));
+                    if !(self_fuel || lit_fuel) {
+                        errors.push(format!("{name}: call to {h} without fuel literal"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        stack.extend(f.children());
+    }
+}
+
+#[test]
+fn work_budget_shapes_hold() {
+    let opt_sets: Vec<Vec<&str>> = vec![
+        vec![],
+        vec!["--max-funcs", "8", "--max-block-size", "8"],
+        vec![
+            "--max-funcs",
+            "8",
+            "--max-expr-depth",
+            "6",
+            "--max-block-size",
+            "6",
+            "--max-loop-iters",
+            "32",
+        ],
+        vec!["--no-safe-math"],
+        vec!["--max-recursion-depth", "3", "--max-loop-iters", "4"],
+    ];
+    for args in &opt_sets {
+        let opts = parse_generator_args(args.clone()).unwrap();
+        let max_iters = opts.max_loop_iters as i64;
+        let max_fuel = opts.max_recursion_depth as i64;
+        for seed in 0..200 {
+            let prog = gen_program(&opts, seed);
+            let sigs = user_sigs(&prog.forms);
+            let mut errors = Vec::new();
+            for (fname, body) in user_bodies(&prog.forms) {
+                check_body_budget(&fname, &body, &sigs, max_iters, max_fuel, &mut errors);
+            }
+            // Entry calls carry shrunk fuel literals too.
+            for f in &prog.forms {
+                if let Form::List(fs) = f
+                    && fs.len() >= 4
+                    && sym(&fs[0]) == Some("defn")
+                    && sym(&fs[1]) == Some("smith-main")
+                {
+                    check_body_budget("<entry>", &fs[3..], &sigs, max_iters, max_fuel, &mut errors);
+                }
+            }
+            assert!(errors.is_empty(), "{args:?} seed {seed}: {errors:?}");
+        }
+    }
 }

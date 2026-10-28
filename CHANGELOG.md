@@ -15,6 +15,9 @@ Initial release.
   wrappers with wrap-around semantics, bounds-checked accessors, bounded
   loops, fuel-guarded recursion, no I/O besides one checksum line, and no
   randomness, time, reflection, interop, or concurrency.
+- Static work budget: per-function call/loop/fuel budgets with shrinking
+  (documented in the README), so generated programs run in seconds at any
+  option setting instead of timing out on pathological fan-out.
 - FNV-1a checksum over all global state and function results as the
   differential-test oracle.
 - `drive` subcommand: generate programs for many seeds, run each under

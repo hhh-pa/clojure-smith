@@ -63,7 +63,8 @@ pub fn gen_program(opts: &GenerateOptions, seed: i64) -> Program {
     let mut global_forms = Vec::with_capacity(n_globals);
     for i in 0..n_globals {
         let gt = random_type(ctx.rng, ctx.opts, &ctx.env.records);
-        let init = gen_literal(ctx.rng, ctx.opts, &ctx.env.records, &gt);
+        // Global initializers run once at load; not charged to any budget.
+        let (init, _) = gen_literal(ctx.rng, ctx.opts, &ctx.env.records, &gt);
         let name = format!("g{i}");
         global_forms.push(Form::call(
             "def",
@@ -86,25 +87,66 @@ pub fn gen_program(opts: &GenerateOptions, seed: i64) -> Program {
         ctx.env.funcs.push(gf.sig);
     }
 
-    // Entry calls: literals, or derefs of type-matching globals.
+    // Entry calls: literals, or derefs of type-matching globals. Every
+    // function is called exactly once. The entry budget is the sum of
+    // body costs (fuel zero for all) plus a fixed slack; recursive fuel
+    // is drawn in a second pass and shrunk to fit the slack, so no call
+    // is ever skipped yet total work stays bounded.
     let sigs = ctx.env.funcs.clone();
+    ctx.spent = 0;
+    ctx.budget = sigs
+        .iter()
+        .map(|s| s.body_cost)
+        .fold(0u64, |a, b| a.saturating_add(b))
+        .saturating_add(crate::cost::WORK_SLACK_ENTRY);
     let mut calls = Vec::with_capacity(sigs.len());
     for sig in &sigs {
         let mut args = Vec::with_capacity(sig.params.len());
         for (i, pt) in sig.params.iter().enumerate() {
             if i == 0 && sig.recursive {
-                args.push(Form::int(ctx.rng.range(0, opts.max_recursion_depth as i64)));
+                args.push(Form::int(0));
             } else {
                 let gd = ctx.globals_of(pt);
                 if !gd.is_empty() && ctx.rng.chance(0.5) {
                     let g = gd[ctx.rng.below(gd.len())].clone();
                     args.push(Form::Deref(Box::new(Form::sym(g))));
                 } else {
-                    args.push(gen_literal(ctx.rng, ctx.opts, &ctx.env.records, pt));
+                    let (lit, cost) = gen_literal(ctx.rng, ctx.opts, &ctx.env.records, pt);
+                    ctx.charge(cost);
+                    args.push(lit);
                 }
             }
         }
+        ctx.charge(sig.body_cost);
         calls.push(Form::call(&sig.name, args));
+    }
+    for (call, sig) in calls.iter_mut().zip(sigs.iter()) {
+        if !sig.recursive {
+            continue;
+        }
+        let drawn = ctx.rng.range(0, opts.max_recursion_depth as i64).max(0) as u64;
+        // Extra over the fuel-zero price already paid: body * (2^k - 1).
+        let mut best = 0u64;
+        let mut k = 0u64;
+        while k < drawn.min(62) {
+            let extra = sig
+                .body_cost
+                .saturating_mul(crate::cost::fuel_factor(k + 1).saturating_sub(1));
+            if extra > ctx.remaining() {
+                break;
+            }
+            k += 1;
+            best = k;
+        }
+        let extra = sig
+            .body_cost
+            .saturating_mul(crate::cost::fuel_factor(best).saturating_sub(1));
+        ctx.charge(extra);
+        if let Form::List(fs) = call
+            && fs.len() > 1
+        {
+            fs[1] = Form::int(best as i64);
+        }
     }
 
     let mut forms = vec![ns_form(&format!("fuzz-{}", seed as u64), !opts.no_strings)];
