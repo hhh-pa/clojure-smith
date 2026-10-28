@@ -61,7 +61,13 @@ pub fn entry_forms(global_names: &[String], calls: Vec<Form>, checksum: bool) ->
             "println",
             vec![
                 Form::string("checksum:"),
-                Form::call("smith-hash", vec![Form::vector(hashed)]),
+                // A list, not a vector: the entry honors --no-vectors too.
+                Form::call(
+                    "smith-hash",
+                    vec![Form::list(
+                        std::iter::once(Form::sym("list")).chain(hashed).collect(),
+                    )],
+                ),
             ],
         )
     } else {

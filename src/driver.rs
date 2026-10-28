@@ -72,6 +72,11 @@ pub fn unique_tag() -> usize {
     UNIQUE.fetch_add(1, Ordering::SeqCst)
 }
 
+/// Maximum seeds in one `--seeds` spec. Ranges are span-capped
+/// individually below, but without a total cap a long comma list (or many
+/// ranges) could exhaust memory before dedup.
+pub const MAX_SEEDS: usize = 1_000_000;
+
 /// Parse a seed spec into a sorted, deduplicated seed list.
 pub fn parse_seeds(spec: &str) -> Result<Vec<i64>, String> {
     let mut out = Vec::new();
@@ -81,6 +86,9 @@ pub fn parse_seeds(spec: &str) -> Result<Vec<i64>, String> {
             continue;
         }
         if let Ok(n) = part.parse::<i64>() {
+            if out.len() >= MAX_SEEDS {
+                return Err(format!("too many seeds (max {MAX_SEEDS})"));
+            }
             out.push(n);
             continue;
         }
@@ -95,8 +103,12 @@ pub fn parse_seeds(spec: &str) -> Result<Vec<i64>, String> {
                 if a > b {
                     return Err(format!("invalid reversed range: {part}"));
                 }
-                if (b as i128 - a as i128) > 1_000_000 {
+                if (b as i128 - a as i128) >= MAX_SEEDS as i128 {
                     return Err(format!("range too large: {part}"));
+                }
+                let span = (b as i128 - a as i128 + 1) as usize;
+                if out.len().saturating_add(span) > MAX_SEEDS {
+                    return Err(format!("too many seeds (max {MAX_SEEDS})"));
                 }
                 out.extend(a..=b);
                 parsed = true;
@@ -125,88 +137,154 @@ pub struct RunOutcome {
     pub timed_out: bool,
     pub spawn_error: Option<String>,
     pub exit: Option<i32>,
+    /// Terminating signal, when the child died by signal (Unix only;
+    /// `exit` is `None` then, which used to print as `exited with None`).
+    pub signal: Option<i32>,
     /// Captured stdout, capped at 1 MiB.
     pub out: Vec<u8>,
     /// Captured stderr, capped at 1 MiB.
     pub err: Vec<u8>,
 }
 
+impl RunOutcome {
+    /// One-line status: `exit 0`, `signal 9`, `timeout`, `spawn error: …`.
+    pub fn status_text(&self) -> String {
+        if self.timed_out {
+            "timeout".to_string()
+        } else if let Some(e) = &self.spawn_error {
+            format!("spawn error: {e}")
+        } else if let Some(c) = self.exit {
+            format!("exit {c}")
+        } else if let Some(s) = self.signal {
+            format!("signal {s}")
+        } else {
+            "unknown status".to_string()
+        }
+    }
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
+/// Quote `path` for `sh -c`: single-quote it, escaping embedded
+/// quotes. Temp paths rarely need this, but a space in `TMPDIR` must not
+/// break runners or, worse, inject shell syntax.
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
 /// Run `cmd_template` via `sh -c`, substituting `{}` with `file` (or
-/// appending the path when the template has no placeholder).
+/// appending the path when the template has no placeholder). The path is
+/// shell-quoted in both cases.
 pub fn run_command(cmd_template: &str, file: &Path, timeout: Duration) -> RunOutcome {
-    let cmd = if cmd_template.contains("{}") {
-        cmd_template.replace("{}", &file.to_string_lossy())
+    let quoted = shell_quote(file);
+    let script = if cmd_template.contains("{}") {
+        cmd_template.replace("{}", &quoted)
     } else {
-        format!("{} {}", cmd_template, file.to_string_lossy())
+        format!("{cmd_template} {quoted}")
     };
-    let mut child = match Command::new("sh")
-        .arg("-c")
-        .arg(&cmd)
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(&script)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    // Own process group, so a timeout can kill the runner's whole tree
+    // (see kill_child).
+    #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             return RunOutcome {
                 timed_out: false,
                 spawn_error: Some(e.to_string()),
                 exit: None,
+                signal: None,
                 out: Vec::new(),
                 err: Vec::new(),
             };
         }
     };
     // Drain both pipes on threads so a chatty child can never block on a
-    // full pipe buffer while we wait for it. Results come back over
-    // channels so that an orphaned grandchild holding the pipes open
-    // cannot hang us past a grace period.
-    fn drain<R: std::io::Read>(h: Option<R>) -> Vec<u8> {
-        use std::io::Read;
-        let mut buf = Vec::new();
-        if let Some(h) = h {
-            let _ = h.take(1 << 20).read_to_end(&mut buf);
+    // full pipe buffer while we wait for it. Chunks land in shared
+    // buffers as they arrive, so output drained before an orphaned
+    // grandchild wedges the pipes is still kept; completion is only a
+    // grace-limited wait.
+    fn drain<R: std::io::Read>(h: Option<R>, buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+        let Some(mut h) = h else { return };
+        let mut tmp = [0u8; 8192];
+        loop {
+            match h.read(&mut tmp) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut b = buf.lock().unwrap();
+                    let room = (1usize << 20).saturating_sub(b.len());
+                    if room == 0 {
+                        break;
+                    }
+                    b.extend_from_slice(&tmp[..n.min(room)]);
+                }
+            }
         }
-        buf
     }
     let (out_tx, out_rx) = std::sync::mpsc::channel();
+    let out_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     std::thread::spawn({
         let h = child.stdout.take();
+        let buf = out_buf.clone();
         move || {
-            let _ = out_tx.send(drain(h));
+            drain(h, buf);
+            let _ = out_tx.send(());
         }
     });
     let (err_tx, err_rx) = std::sync::mpsc::channel();
+    let err_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     std::thread::spawn({
         let h = child.stderr.take();
+        let buf = err_buf.clone();
         move || {
-            let _ = err_tx.send(drain(h));
+            drain(h, buf);
+            let _ = err_tx.send(());
         }
     });
     // The error arm below returns early; gather output through this.
-    let gather = |out_rx: std::sync::mpsc::Receiver<Vec<u8>>,
-                  err_rx: std::sync::mpsc::Receiver<Vec<u8>>| {
+    // Whatever arrived before the grace expires is kept.
+    let gather = |out_rx: std::sync::mpsc::Receiver<()>, err_rx: std::sync::mpsc::Receiver<()>| {
         let grace = Duration::from_secs(2);
+        let _ = out_rx.recv_timeout(grace);
+        let _ = err_rx.recv_timeout(grace);
         (
-            out_rx.recv_timeout(grace).unwrap_or_default(),
-            err_rx.recv_timeout(grace).unwrap_or_default(),
+            out_buf.lock().unwrap().clone(),
+            err_buf.lock().unwrap().clone(),
         )
     };
     // The standard library has no wait-with-timeout, so poll.
     let start = Instant::now();
     let mut timed_out = false;
     let mut exit = None;
+    let mut signal = None;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 exit = status.code();
+                signal = exit_signal(&status);
                 break;
             }
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_child(&mut child);
                     timed_out = true;
                     break;
                 }
@@ -218,6 +296,7 @@ pub fn run_command(cmd_template: &str, file: &Path, timeout: Duration) -> RunOut
                     timed_out: false,
                     spawn_error: Some(e.to_string()),
                     exit: None,
+                    signal: None,
                     out,
                     err,
                 };
@@ -229,9 +308,31 @@ pub fn run_command(cmd_template: &str, file: &Path, timeout: Duration) -> RunOut
         timed_out,
         spawn_error: None,
         exit,
+        signal,
         out,
         err,
     }
+}
+
+/// Kill a timed-out child and its whole process tree. The child is
+/// `sh -c` in its own process group, so `child.kill()` alone would
+/// orphan the real runner (the JVM) behind it.
+#[cfg(unix)]
+fn kill_child(child: &mut std::process::Child) {
+    // Group leader == child pid after `process_group(0)`.
+    let pgid = child.id() as libc::pid_t;
+    // SAFETY: killpg on a valid pgid has no memory effects; if it fails
+    // (already reaped, no permission) fall back to killing the child.
+    if unsafe { libc::killpg(pgid, libc::SIGKILL) } != 0 {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn kill_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 // ---------------------------------------------------------------------------
@@ -260,7 +361,22 @@ fn run_seed(
     timeout: Duration,
     seed: i64,
 ) -> SeedResult {
-    let prog = gen_program(gopts, seed);
+    // A generator panic must fail this seed, not the whole drive (in a
+    // worker thread it would otherwise abort every other seed too).
+    let prog =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gen_program(gopts, seed))) {
+            Ok(p) => p,
+            Err(_) => {
+                return SeedResult {
+                    seed,
+                    status: Status::Error,
+                    detail: "generator panicked".to_string(),
+                    threw_on_all: false,
+                    program: String::new(),
+                    outcomes: Vec::new(),
+                };
+            }
+        };
     let program = emit_program(&prog, gopts);
 
     let dir = std::env::temp_dir().join(format!(
@@ -316,7 +432,7 @@ fn run_seed(
             return SeedResult {
                 seed,
                 status: Status::Error,
-                detail: format!("runner {i} exited with {:?}", o.exit),
+                detail: format!("runner {i}: {}", o.status_text()),
                 threw_on_all: false,
                 program,
                 outcomes,
@@ -346,23 +462,31 @@ fn run_seed(
     }
 }
 
-fn save_failure(fail_dir: &Path, result: &SeedResult) {
+fn save_failure(fail_dir: &Path, result: &SeedResult) -> std::io::Result<PathBuf> {
     let dir = fail_dir.join(format!("seed-{}", result.seed));
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
+    // Start fresh: a previous drive may have saved a different-shaped
+    // failure (fewer runners, timeout vs mismatch) under the same name,
+    // and stale files would mislead the reducer.
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
     }
-    let _ = std::fs::write(dir.join("prog.clj"), &result.program);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("prog.clj"), &result.program)?;
     for (i, o) in result.outcomes.iter().enumerate() {
-        let _ = std::fs::write(dir.join(format!("runner-{i}.stdout")), &o.out);
-        let _ = std::fs::write(dir.join(format!("runner-{i}.stderr")), &o.err);
-        let status = if o.timed_out {
-            "timeout".to_string()
-        } else if let Some(e) = &o.spawn_error {
-            format!("spawn error: {e}")
-        } else {
-            format!("exit {:?}", o.exit)
-        };
-        let _ = std::fs::write(dir.join(format!("runner-{i}.status")), status);
+        std::fs::write(dir.join(format!("runner-{i}.stdout")), &o.out)?;
+        std::fs::write(dir.join(format!("runner-{i}.stderr")), &o.err)?;
+        std::fs::write(dir.join(format!("runner-{i}.status")), o.status_text())?;
+    }
+    Ok(dir)
+}
+
+fn save_failure_report(fail_dir: &Path, result: &SeedResult) {
+    match save_failure(fail_dir, result) {
+        Ok(dir) => eprintln!("  saved to {}", dir.display()),
+        Err(e) => eprintln!(
+            "  warning: could not save {}: {e}",
+            fail_dir.join(format!("seed-{}", result.seed)).display()
+        ),
     }
 }
 
@@ -403,6 +527,12 @@ pub fn run_drive(opts: &DriveOptions) -> i32 {
         return 2;
     }
     gopts.quiet = true; // Failure files stay clean; progress goes to stderr.
+    if gopts.no_checksum {
+        eprintln!(
+            "clojure-smith drive: warning: --no-checksum disables the differential oracle; \
+             every runner prints \"done\" and only crashes can diverge"
+        );
+    }
     let runners = opts.runners();
     let timeout = Duration::from_secs(opts.timeout);
 
@@ -466,19 +596,26 @@ pub fn run_drive(opts: &DriveOptions) -> i32 {
             Status::Mismatch => {
                 mismatches += 1;
                 eprintln!("seed {}: MISMATCH", r.seed);
-                save_failure(&opts.fail_dir, r);
-                eprintln!("  saved to {}/seed-{}", opts.fail_dir.display(), r.seed);
+                save_failure_report(&opts.fail_dir, r);
             }
             Status::Error => {
                 errors += 1;
                 eprintln!("seed {}: ERROR: {}", r.seed, r.detail);
-                save_failure(&opts.fail_dir, r);
-                eprintln!("  saved to {}/seed-{}", opts.fail_dir.display(), r.seed);
+                save_failure_report(&opts.fail_dir, r);
             }
         }
     }
     eprintln!("clojure-smith drive: {ok} ok, {mismatches} mismatch, {errors} error");
-    if mismatches + errors > 0 { 1 } else { 0 }
+    // Exit codes: 0 all agree, 1 divergences found (the interesting case),
+    // 2 bad usage (returned earlier), 3 failures without any clean
+    // comparison (timeouts, panics, spawn errors).
+    if mismatches > 0 {
+        1
+    } else if errors > 0 {
+        3
+    } else {
+        0
+    }
 }
 
 #[cfg(test)]
@@ -497,13 +634,17 @@ mod tests {
         assert!(parse_seeds("3-1").is_err());
         assert!(parse_seeds("abc").is_err());
         assert!(parse_seeds("0-2000000").is_err());
+        // Two individually fine ranges exceed the total cap.
+        assert!(parse_seeds("0-600000,1000000-1600000").is_err());
+        assert_eq!(parse_seeds("0-999999").unwrap().len(), MAX_SEEDS);
     }
 
     #[cfg(unix)]
     #[test]
     fn command_basics() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("cs-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("cs-test-{}-{}", std::process::id(), unique_tag()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("f.txt");
@@ -540,7 +681,8 @@ mod tests {
     #[test]
     fn drive_plumbing_with_cat() {
         // `cat` runners trivially agree; exercises staging/comparison.
-        let dir = std::env::temp_dir().join(format!("cs-drive-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("cs-drive-{}-{}", std::process::id(), unique_tag()));
         let _ = std::fs::remove_dir_all(&dir);
         let opts = DriveOptions {
             seeds: "1-2".to_string(),
@@ -558,7 +700,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn drive_detects_mismatch() {
-        let dir = std::env::temp_dir().join(format!("cs-mism-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("cs-mism-{}-{}", std::process::id(), unique_tag()));
         let _ = std::fs::remove_dir_all(&dir);
         let opts = DriveOptions {
             seeds: "5".to_string(),
@@ -572,6 +715,181 @@ mod tests {
         assert_eq!(run_drive(&opts), 1);
         assert!(dir.join("failures/seed-5/prog.clj").exists());
         assert!(dir.join("failures/seed-5/runner-0.stdout").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drive_failure_dir_is_fresh_and_fallible() {
+        let dir =
+            std::env::temp_dir().join(format!("cs-save-{}-{}", std::process::id(), unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |fail_dir: std::path::PathBuf| DriveOptions {
+            seeds: "5".to_string(),
+            runner: vec!["echo one".to_string(), "echo two".to_string()],
+            timeout: 30,
+            fail_dir,
+            jobs: 1,
+            quiet: true,
+            gen_opts: vec![],
+        };
+        // A stale file from a previous drive must not survive.
+        let stale = dir.join("failures/seed-5/stale.txt");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, "stale").unwrap();
+        assert_eq!(run_drive(&mk(dir.join("failures"))), 1);
+        assert!(!stale.exists());
+        assert!(dir.join("failures/seed-5/prog.clj").exists());
+        // An unwritable fail dir warns but still reports the mismatch.
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, "not a dir").unwrap();
+        assert_eq!(run_drive(&mk(blocker)), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drive_errors_without_mismatch_exit_3() {
+        let dir =
+            std::env::temp_dir().join(format!("cs-err-{}-{}", std::process::id(), unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let opts = DriveOptions {
+            seeds: "5".to_string(),
+            runner: vec!["false".to_string()],
+            timeout: 30,
+            fail_dir: dir.join("failures"),
+            jobs: 1,
+            quiet: true,
+            gen_opts: vec![],
+        };
+        // No clean comparison was possible: distinct from "found a
+        // divergence" (1) and "all agree" (0).
+        assert_eq!(run_drive(&opts), 3);
+        assert!(dir.join("failures/seed-5/prog.clj").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_texts() {
+        let base = RunOutcome {
+            timed_out: false,
+            spawn_error: None,
+            exit: None,
+            signal: None,
+            out: Vec::new(),
+            err: Vec::new(),
+        };
+        assert_eq!(
+            RunOutcome {
+                exit: Some(3),
+                ..base.clone()
+            }
+            .status_text(),
+            "exit 3"
+        );
+        assert_eq!(
+            RunOutcome {
+                signal: Some(9),
+                ..base.clone()
+            }
+            .status_text(),
+            "signal 9"
+        );
+        assert_eq!(
+            RunOutcome {
+                timed_out: true,
+                ..base.clone()
+            }
+            .status_text(),
+            "timeout"
+        );
+        assert_eq!(
+            RunOutcome {
+                spawn_error: Some("nope".to_string()),
+                ..base.clone()
+            }
+            .status_text(),
+            "spawn error: nope"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_quotes_paths_with_spaces() {
+        let dir =
+            std::env::temp_dir().join(format!("cs-quote-{}-{}", std::process::id(), unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a b'c.txt");
+        std::fs::write(&file, "spaced\n").unwrap();
+        // Unquoted, the space would split the path into two arguments.
+        let o = run_command("cat {}", &file, Duration::from_secs(10));
+        assert_eq!(o.exit, Some(0));
+        assert_eq!(o.out, b"spaced\n");
+        let o = run_command("cat", &file, Duration::from_secs(10));
+        assert_eq!(o.out, b"spaced\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_reports_signals() {
+        let dir =
+            std::env::temp_dir().join(format!("cs-sig-{}-{}", std::process::id(), unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "x").unwrap();
+        let o = run_command("kill -9 $$ #{}", &file, Duration::from_secs(10));
+        assert_eq!(o.exit, None);
+        assert_eq!(o.signal, Some(9));
+        assert_eq!(o.status_text(), "signal 9");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_grandchildren() {
+        // The background sleep would create the flag at 3s; the timeout
+        // fires at 1s and must take the whole process group with it.
+        let dir =
+            std::env::temp_dir().join(format!("cs-pg-{}-{}", std::process::id(), unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let flag = dir.join("survived");
+        let o = run_command(
+            "(echo dying; sleep 3; touch {}) & wait",
+            &flag,
+            Duration::from_secs(1),
+        );
+        assert!(o.timed_out);
+        assert_eq!(o.out, b"dying\n");
+        std::thread::sleep(Duration::from_secs(4));
+        assert!(!flag.exists(), "grandchild survived the timeout kill");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lingering_grandchild_keeps_partial_output() {
+        // `setsid` detaches and holds the pipes past the grace period
+        // (the shell itself exits right away); output drained before
+        // that must survive instead of coming back empty.
+        let dir =
+            std::env::temp_dir().join(format!("cs-part-{}-{}", std::process::id(), unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "x").unwrap();
+        let o = run_command(
+            "echo hello; setsid sleep 5 #{}",
+            &file,
+            Duration::from_secs(10),
+        );
+        assert!(!o.timed_out);
+        assert_eq!(o.exit, Some(0));
+        assert_eq!(o.out, b"hello\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

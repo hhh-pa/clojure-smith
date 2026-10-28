@@ -114,6 +114,7 @@ name = "clojure-smith"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "rand",
  "rand_chacha",
 ]

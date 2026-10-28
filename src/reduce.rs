@@ -40,15 +40,23 @@ pub struct ReduceOptions {
     /// Suppress the summary report.
     #[arg(long)]
     pub quiet: bool,
+
+    /// Treat a test-command timeout as "still interesting", for reducing
+    /// hangs. Pair with a short `--timeout`: every evaluation that still
+    /// hangs costs the full timeout.
+    #[arg(long)]
+    pub timeout_is_interesting: bool,
 }
 
 struct Reducer {
     test: String,
     timeout: Duration,
+    timeout_is_interesting: bool,
     /// 0 = unlimited.
     limit: u64,
     used: u64,
     tmp: PathBuf,
+    last: Option<crate::driver::RunOutcome>,
 }
 
 impl Reducer {
@@ -66,7 +74,10 @@ impl Reducer {
             return false;
         }
         let o = run_command(&self.test, &self.tmp, self.timeout);
-        !o.timed_out && o.spawn_error.is_none() && o.exit == Some(0)
+        let interesting = o.spawn_error.is_none()
+            && (o.exit == Some(0) || (self.timeout_is_interesting && o.timed_out));
+        self.last = Some(o);
+        interesting
     }
 
     fn exhausted(&self) -> bool {
@@ -169,13 +180,42 @@ fn replace_at(form: &Form, path: &[Step], new: &Form) -> Form {
 fn consts() -> Vec<Form> {
     vec![
         Form::int(0),
+        Form::int(1),
         Form::float(0.0),
         Form::boolean(false),
+        Form::boolean(true),
         Form::string(""),
         Form::nil(),
         Form::vector(vec![]),
         Form::map(vec![]),
     ]
+}
+
+/// The subform at `path`, mirroring [`replace_at`]. Panics on stale paths.
+fn get_at<'a>(form: &'a Form, path: &[Step]) -> &'a Form {
+    let mut node = form;
+    for step in path {
+        node = match (node, step) {
+            (Form::List(fs) | Form::Vector(fs) | Form::Set(fs), Step::Child(i)) => &fs[*i],
+            (Form::Map(ps), Step::Key(i)) => &ps[*i].0,
+            (Form::Map(ps), Step::Val(i)) => &ps[*i].1,
+            (Form::Quote(x) | Form::Deref(x), Step::Child(0)) => x,
+            (Form::Meta(m, _), Step::Child(0)) => m,
+            (Form::Meta(_, x), Step::Child(1)) => x,
+            _ => panic!("stale reducer path: {path:?}"),
+        };
+    }
+    node
+}
+
+/// Drop candidates for a node: a list can try each element, a quote or
+/// deref its child (`(println X)` -> `X`). Anything else has none.
+fn drop_kids(node: &Form) -> Vec<Form> {
+    match node {
+        Form::List(fs) => fs.clone(),
+        Form::Quote(x) | Form::Deref(x) => vec![(**x).clone()],
+        _ => Vec::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +297,76 @@ fn scalar_pass(r: &mut Reducer, mut forms: Vec<Form>) -> Vec<Form> {
     forms
 }
 
+/// Explain an uninteresting input: a broken test command (exit 2)
+/// must not masquerade as an uninteresting case (exit 1). The command
+/// runs under `sh -c`, so a missing command surfaces as exit 127 with a
+/// "not found" diagnostic rather than a spawn error. Returns the process
+/// exit code.
+fn report_uninteresting(r: &Reducer, timeout_is_interesting: bool) -> i32 {
+    if let Some(o) = &r.last {
+        if let Some(e) = &o.spawn_error {
+            eprintln!("clojure-smith reduce: test command could not start: {e}");
+            return 2;
+        }
+        if o.exit == Some(127) {
+            let err = String::from_utf8_lossy(&o.err);
+            if err.contains("not found") {
+                let first = err.lines().next().unwrap_or("").trim();
+                eprintln!(
+                    "clojure-smith reduce: test command not found ({first}); check --test spelling"
+                );
+                return 2;
+            }
+        }
+    }
+    if timeout_is_interesting {
+        eprintln!(
+            "clojure-smith reduce: input is not interesting (test exited nonzero without timing out)"
+        );
+    } else {
+        eprintln!("clojure-smith reduce: input is not interesting (test exited nonzero)");
+    }
+    1
+}
+
+/// Try replacing every list-typed subform with each of its children.
+/// This collapses nesting the scalar pass cannot (`(println X)` -> `X`
+/// keeps `X`'s content, while no constant does).
+fn drop_pass(r: &mut Reducer, mut forms: Vec<Form>) -> Vec<Form> {
+    for idx in 0..forms.len() {
+        loop {
+            if r.exhausted() {
+                return forms;
+            }
+            let paths = collect_paths(&forms[idx]);
+            let cur_size = forms[idx].size();
+            let mut changed = false;
+            'paths: for path in &paths {
+                for kid in drop_kids(get_at(&forms[idx], path)) {
+                    if r.exhausted() {
+                        return forms;
+                    }
+                    let replaced = replace_at(&forms[idx], path, &kid);
+                    if replaced.size() >= cur_size {
+                        continue;
+                    }
+                    let mut cand = forms.clone();
+                    cand[idx] = replaced;
+                    if r.is_interesting(&cand) {
+                        forms = cand;
+                        changed = true;
+                        break 'paths;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+    forms
+}
+
 fn reduce_forms(r: &mut Reducer, mut forms: Vec<Form>) -> Vec<Form> {
     loop {
         let before = total_size(&forms);
@@ -265,6 +375,10 @@ fn reduce_forms(r: &mut Reducer, mut forms: Vec<Form>) -> Vec<Form> {
             return forms;
         }
         forms = scalar_pass(r, forms);
+        if r.exhausted() {
+            return forms;
+        }
+        forms = drop_pass(r, forms);
         if r.exhausted() {
             return forms;
         }
@@ -309,14 +423,16 @@ pub fn run_reduce(opts: &ReduceOptions) -> i32 {
     let mut r = Reducer {
         test: opts.test.clone(),
         timeout: Duration::from_secs(opts.timeout),
+        timeout_is_interesting: opts.timeout_is_interesting,
         limit: opts.tries,
         used: 0,
         tmp: tmp.clone(),
+        last: None,
     };
     if !r.is_interesting(&forms) {
-        eprintln!("clojure-smith reduce: input is not interesting (test exited nonzero)");
+        let code = report_uninteresting(&r, opts.timeout_is_interesting);
         let _ = std::fs::remove_file(&tmp);
-        return 1;
+        return code;
     }
     let before_forms = forms.len();
     let before_bytes = text.len();
@@ -360,14 +476,15 @@ pub fn run_reduce(opts: &ReduceOptions) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::unique_tag;
     use crate::form::parse_one;
 
     #[test]
     fn paths_and_replace() {
         let f = parse_one("(a [1 {:k v}])").unwrap();
         let paths = collect_paths(&f);
-        assert!(paths.contains(&vec![]));
-        assert!(paths.iter().all(|p| !p.is_empty() || true));
+        // The root (empty) path appears exactly once.
+        assert_eq!(paths.iter().filter(|p| p.is_empty()).count(), 1);
         // Root-first ordering: parents precede children.
         let pos = |p: Vec<Step>| paths.iter().position(|x| *x == p).unwrap();
         assert!(pos(vec![]) < pos(vec![Step::Child(1)]));
@@ -387,7 +504,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reduces_with_grep_predicate() {
-        let dir = std::env::temp_dir().join(format!("cs-reduce-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("cs-reduce-{}-{}", std::process::id(), unique_tag()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let input = dir.join("prog.clj");
@@ -404,6 +522,7 @@ mod tests {
             tries: 10000,
             timeout: 30,
             quiet: true,
+            timeout_is_interesting: false,
         };
         assert_eq!(run_reduce(&opts), 0);
         let reduced = std::fs::read_to_string(&output).unwrap();
@@ -419,7 +538,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn rejects_uninteresting_input() {
-        let dir = std::env::temp_dir().join(format!("cs-red2-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("cs-red2-{}-{}", std::process::id(), unique_tag()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let input = dir.join("prog.clj");
@@ -431,6 +551,81 @@ mod tests {
             tries: 100,
             timeout: 30,
             quiet: true,
+            timeout_is_interesting: false,
+        };
+        assert_eq!(run_reduce(&opts), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_at_mirrors_replace() {
+        let f = parse_one("(a [1 {:k v}])").unwrap();
+        for path in collect_paths(&f) {
+            let node = get_at(&f, &path);
+            let back = replace_at(&f, &path, node);
+            assert_eq!(back, f, "roundtrip failed at {path:?}");
+        }
+        assert_eq!(
+            get_at(&f, &[Step::Child(1), Step::Child(1), Step::Val(0)]),
+            &Form::sym("v")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_pass_collapses_nesting() {
+        // Only dropping (not constants) can reduce this to `:MAGIC`.
+        let dir =
+            std::env::temp_dir().join(format!("cs-red4-{}-{}", std::process::id(), unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("prog.clj");
+        let output = dir.join("small.clj");
+        std::fs::write(&input, "(println (str :a :MAGIC))\n").unwrap();
+        let opts = ReduceOptions {
+            test: "grep -q MAGIC {}".to_string(),
+            input,
+            output: Some(output.clone()),
+            tries: 10000,
+            timeout: 30,
+            quiet: true,
+            timeout_is_interesting: false,
+        };
+        assert_eq!(run_reduce(&opts), 0);
+        let reduced = std::fs::read_to_string(&output).unwrap();
+        assert_eq!(reduced.trim(), ":MAGIC", "{reduced:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_test_command_is_usage_error() {
+        let dir =
+            std::env::temp_dir().join(format!("cs-red3-{}-{}", std::process::id(), unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("prog.clj");
+        std::fs::write(&input, "(println :hello)\n").unwrap();
+        // A mistyped command must report exit 2, not "not interesting".
+        let opts = ReduceOptions {
+            test: "csmith-no-such-command-xyz {}".to_string(),
+            input: input.clone(),
+            output: None,
+            tries: 100,
+            timeout: 30,
+            quiet: true,
+            timeout_is_interesting: false,
+        };
+        assert_eq!(run_reduce(&opts), 2);
+        // A working command with a nonzero exit stays "not interesting".
+        let opts = ReduceOptions {
+            test: "false {}".to_string(),
+            input,
+            output: None,
+            tries: 100,
+            timeout: 30,
+            quiet: true,
+            timeout_is_interesting: false,
         };
         assert_eq!(run_reduce(&opts), 1);
         let _ = std::fs::remove_dir_all(&dir);

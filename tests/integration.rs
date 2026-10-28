@@ -4,6 +4,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use clojure_smith::driver::unique_tag;
+
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_clojure-smith"))
 }
@@ -17,7 +19,11 @@ fn clojure_available() -> bool {
 }
 
 fn tmpdir(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("cs-it-{}-{name}", std::process::id()));
+    let d = std::env::temp_dir().join(format!(
+        "cs-it-{}-{name}-{}",
+        std::process::id(),
+        unique_tag()
+    ));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -69,6 +75,22 @@ fn cli_help_version_and_errors() {
     assert!(
         !Command::new(&bin)
             .args(["--max-map-size", "9"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        !Command::new(&bin)
+            .args(["--max-string-len", "5000"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        !Command::new(&bin)
+            .args(["--max-vector-len", "2000"])
             .output()
             .unwrap()
             .status
@@ -203,5 +225,53 @@ fn reduce_shrinks_generated_program() {
     let after = std::fs::read_to_string(&small).unwrap();
     assert!(after.len() < before.len(), "not reduced");
     assert!(after.contains("smith-hash") && after.contains("checksum"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Suppressed-feature programs must still run: generation under each
+/// `--no-*` combination produces a program that exits 0 with a single
+/// checksum line (the structural suppression matrix only checks syntax).
+#[test]
+fn suppressed_programs_run() {
+    if !clojure_available() {
+        eprintln!("skipping: clojure not on PATH");
+        return;
+    }
+    let dir = tmpdir("sup");
+    let cases: &[&[&str]] = &[
+        &["--no-vectors", "--no-maps", "--no-records"],
+        &["--no-loops", "--no-recursion", "--no-higher-order"],
+        &["--no-strings", "--no-doubles", "--no-bitops", "--no-divs"],
+        &[
+            "--no-vectors",
+            "--no-maps",
+            "--no-strings",
+            "--no-doubles",
+            "--no-records",
+            "--no-loops",
+            "--no-recursion",
+            "--no-globals",
+            "--no-higher-order",
+            "--no-bitops",
+            "--no-divs",
+        ],
+    ];
+    for (i, extra) in cases.iter().enumerate() {
+        let file = dir.join(format!("sup-{i}.clj"));
+        let mut cmd = Command::new(binary());
+        cmd.args(["--seed", "7", "--quiet"]).arg("-o").arg(&file);
+        for a in *extra {
+            cmd.arg(a);
+        }
+        assert!(cmd.status().unwrap().success(), "generate {extra:?}");
+        let (ok, out) = run_clojure(&file);
+        assert!(ok, "{extra:?} exited nonzero");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 1, "{extra:?}: expected one line: {out:?}");
+        assert!(lines[0].starts_with("checksum: "), "{extra:?}: {out:?}");
+        lines[0]["checksum: ".len()..]
+            .parse::<i64>()
+            .expect("checksum must be an integer");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

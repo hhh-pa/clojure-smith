@@ -84,7 +84,7 @@ pub fn random_scalar_type(rng: &mut Rng, opts: &GenerateOptions) -> ValType {
 
 /// A random scalar-or-record type: the element type of composites.
 pub fn random_elem_type(rng: &mut Rng, opts: &GenerateOptions, records: &[RecordDef]) -> ValType {
-    if !records.is_empty() && rng.chance(0.15) {
+    if !opts.no_records && !records.is_empty() && rng.chance(0.15) {
         ValType::Record(rng.below(records.len()))
     } else {
         random_scalar_type(rng, opts)
@@ -108,7 +108,7 @@ pub fn random_type(rng: &mut Rng, opts: &GenerateOptions, records: &[RecordDef])
     if !opts.no_maps {
         kinds.push((10, 5));
     }
-    if !records.is_empty() {
+    if !opts.no_records && !records.is_empty() {
         kinds.push((8, 6));
     }
     let weights: Vec<u64> = kinds.iter().map(|(w, _)| *w).collect();
@@ -229,11 +229,20 @@ const TRICKY_STRINGS: &[&str] = &[
 const STR_ALPHABET: &[u8] =
     b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-+.,!?";
 
+/// Hard ceiling on a drawn string length. String and vector sizes
+/// multiply (a vector literal holds many strings), so one uncapped draw
+/// could allocate gigabytes in a single literal; totals beyond that are
+/// bounded by budget charging of literal sizes.
+pub const MAX_STRING_DRAW: usize = 4096;
+
+/// Hard ceiling on a drawn vector literal length (see `MAX_STRING_DRAW`).
+pub const MAX_VECTOR_DRAW: usize = 1024;
+
 fn gen_string(rng: &mut Rng, max_len: usize) -> String {
     if rng.chance(0.15) {
         return rng.pick(TRICKY_STRINGS).to_string();
     }
-    let n = rng.below(max_len + 1);
+    let n = rng.below(max_len.min(MAX_STRING_DRAW) + 1);
     (0..n).map(|_| *rng.pick(STR_ALPHABET) as char).collect()
 }
 
@@ -251,7 +260,7 @@ pub fn gen_literal(
         ValType::Bool => Form::boolean(rng.next_bool()),
         ValType::Str => Form::string(gen_string(rng, opts.max_string_len as usize)),
         ValType::Vec(elem) => {
-            let n = rng.below(opts.max_vector_len as usize + 1);
+            let n = rng.below((opts.max_vector_len as usize).min(MAX_VECTOR_DRAW) + 1);
             Form::vector(
                 (0..n)
                     .map(|_| gen_literal(rng, opts, records, elem).0)
@@ -337,6 +346,28 @@ mod tests {
                 ValType::Vec(e) | ValType::Map(e) => contains(e, want),
                 _ => false,
             }
+    }
+
+    #[test]
+    fn literal_draws_clamp_without_validate() {
+        // Library users can skip validate(): absurd maxima must still
+        // draw bounded literals, never gigabyte allocations.
+        let o = opts(&["--max-string-len", "1000000", "--max-vector-len", "1000000"]);
+        let mut rng = Rng::new(7);
+        for _ in 0..50 {
+            let lit = gen_literal(&mut rng, &o, &[], &ValType::Str).0;
+            if let Form::Str(s) = lit {
+                assert!(s.len() <= MAX_STRING_DRAW, "string len {}", s.len());
+            } else {
+                panic!("expected string literal, got {lit:?}");
+            }
+            let lit = gen_literal(&mut rng, &o, &[], &ValType::Vec(Box::new(ValType::Long))).0;
+            if let Form::Vector(v) = lit {
+                assert!(v.len() <= MAX_VECTOR_DRAW, "vector len {}", v.len());
+            } else {
+                panic!("expected vector literal, got {lit:?}");
+            }
+        }
     }
 
     #[test]

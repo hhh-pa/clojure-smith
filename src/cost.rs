@@ -62,6 +62,19 @@ pub fn shrink_trips(drawn: i64, per_trip: u64, remaining: u64) -> i64 {
     drawn.min(afford).max(0)
 }
 
+/// Trip cap for a `loop` whose update mentions the accumulator `refs`
+/// times: each trip can grow the accumulator by up to `refs`x (e.g.
+/// `(vec (interleave acc acc))` doubles it), so trips are capped to keep
+/// `refs^trips` small. A single mention cannot amplify (`i64::MAX`
+/// leaves the other bounds in charge).
+pub fn acc_growth_cap(refs: usize) -> i64 {
+    if refs <= 1 {
+        i64::MAX
+    } else {
+        (32 >> refs.min(5)).max(2)
+    }
+}
+
 /// Per-collection take bound for `doseq`/`for` over `n_bindings` collections
 /// (cartesian trips) whose body costs `per_trip` per trip. Zero is valid
 /// (empty trips); the result always fits in an `i64` literal.
@@ -116,6 +129,17 @@ mod tests {
         assert_eq!(shrink_trips(30, 100, 50), 0);
         assert_eq!(shrink_trips(30, 0, 1_000), 30);
         assert_eq!(shrink_trips(-4, 100, 1_000), 0);
+    }
+
+    #[test]
+    fn growth_cap_bounds_doubling() {
+        assert_eq!(acc_growth_cap(0), i64::MAX);
+        assert_eq!(acc_growth_cap(1), i64::MAX);
+        assert_eq!(acc_growth_cap(2), 8); // 2^8 = 256x
+        assert_eq!(acc_growth_cap(3), 4); // 3^4 = 81x
+        assert_eq!(acc_growth_cap(4), 2);
+        assert_eq!(acc_growth_cap(5), 2);
+        assert_eq!(acc_growth_cap(100), 2);
     }
 
     #[test]

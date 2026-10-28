@@ -355,7 +355,11 @@ pub fn gen_stmt(ctx: &mut Ctx) -> Form {
     }
     if !no_loops && can_nest {
         kinds.push((1, 5));
-        kinds.push((1, 6));
+        // doseq iterates a vector-typed collection, so it is also gated
+        // on vectors (its coll used to panic the generator outright).
+        if !ctx.opts.no_vectors {
+            kinds.push((1, 6));
+        }
     }
     match pick_kind(ctx, &kinds) {
         1 => gen_swap(ctx),
@@ -453,7 +457,15 @@ fn gen_loop(ctx: &mut Ctx, t: &ValType) -> Form {
         // once during generation, and each further trip pays again.
         let per_trip = ctx.spent.saturating_sub(before).max(1);
         let drawn = ctx.rng.range(0, cap);
-        let iters = crate::cost::shrink_trips(drawn, per_trip, ctx.remaining());
+        let mut iters = crate::cost::shrink_trips(drawn, per_trip, ctx.remaining());
+        // A growable accumulator mentioned twice or more amplifies
+        // geometrically (`(vec (interleave acc acc))` doubles per trip),
+        // which the linear work budget cannot see: cap trips so the
+        // result stays small. Scalars cannot grow, records have fixed
+        // fields, so those keep the full trip range.
+        if matches!(t, ValType::Vec(_) | ValType::Map(_) | ValType::Str) {
+            iters = iters.min(crate::cost::acc_growth_cap(update.count_sym("acc")));
+        }
         ctx.charge(
             (iters.max(0) as u64)
                 .saturating_sub(1)
@@ -903,6 +915,10 @@ fn reduce_cands(ctx: &Ctx, t: &ValType) -> Vec<FuncSig> {
 }
 
 fn gen_reduce(ctx: &mut Ctx, t: &ValType) -> Form {
+    // The collection is always vector-typed.
+    if ctx.opts.no_vectors {
+        return gen_leaf(ctx, t);
+    }
     let cands = reduce_cands(ctx, t);
     if cands.is_empty() {
         return gen_leaf(ctx, t);
@@ -953,7 +969,10 @@ fn gen_long_op(ctx: &mut Ctx) -> Form {
     if !o.no_higher_order && !reduce_cands(ctx, &ValType::Long).is_empty() {
         kinds.push((1, 11));
     }
-    kinds.push((1, 12));
+    // count-of-name needs strings.
+    if !o.no_strings {
+        kinds.push((1, 12));
+    }
     match pick_kind(ctx, &kinds) {
         1 => gen_long_unary(ctx),
         2 => gen_long_div(ctx),
@@ -1141,7 +1160,11 @@ fn gen_double_op(ctx: &mut Ctx) -> Form {
             // Inf/NaN. Object-typed operands (params, derefs, calls)
             // therefore need `s-div`, which retypes both sides.
             let div = if ctx.opts.no_safe_math { "/" } else { "s-div" };
-            let op = ["+", "-", "*", div][ctx.rng.below(4)];
+            let op = if ctx.opts.no_divs {
+                ["+", "-", "*"][ctx.rng.below(3)]
+            } else {
+                ["+", "-", "*", div][ctx.rng.below(4)]
+            };
             let a = gen_expr(ctx, &ValType::Double);
             let b = gen_expr(ctx, &ValType::Double);
             Form::call(op, vec![a, b])
@@ -1287,9 +1310,19 @@ fn gen_long_pred(ctx: &mut Ctx) -> Form {
 
 fn gen_type_pred(ctx: &mut Ctx) -> Form {
     nested(ctx, 1, 0, |ctx| {
-        let op = [
-            "string?", "number?", "vector?", "map?", "boolean?", "keyword?",
-        ][ctx.rng.below(6)];
+        // Only predicates for enabled types: a `vector?` that can never
+        // be true is dead weight (and violates --no-vectors).
+        let mut ops = vec!["number?", "boolean?", "keyword?"];
+        if !ctx.opts.no_strings {
+            ops.push("string?");
+        }
+        if !ctx.opts.no_vectors {
+            ops.push("vector?");
+        }
+        if !ctx.opts.no_maps {
+            ops.push("map?");
+        }
+        let op = ops[ctx.rng.below(ops.len())];
         let t = random_type(ctx.rng, ctx.opts, &ctx.env.records);
         let a = gen_expr(ctx, &t);
         Form::call(op, vec![a])
@@ -1484,7 +1517,10 @@ fn gen_vec_op(ctx: &mut Ctx, e: &ValType) -> Form {
     if *e == ValType::Long {
         kinds.push((1, 7));
     }
-    kinds.push((1, 8));
+    // `for` is a loop (unlike `range` alone, which is inert data).
+    if !o.no_loops {
+        kinds.push((1, 8));
+    }
     if !o.no_maps {
         kinds.push((1, 9));
     }
@@ -1546,7 +1582,12 @@ fn gen_vec_op(ctx: &mut Ctx, e: &ValType) -> Form {
         }),
         7 => {
             let max_iters = ctx.opts.max_loop_iters as i64;
-            let n = ctx.rng.range(0, max_iters);
+            let drawn = ctx.rng.range(0, max_iters);
+            // Realizing `(range n)` costs per element: shrink to fit the
+            // remaining budget and charge it (an 800k range used to be
+            // free, blowing time and memory outside the budget).
+            let n = crate::cost::shrink_trips(drawn, 1, ctx.remaining());
+            ctx.charge(n.max(0) as u64);
             Form::call("vec", vec![Form::call("range", vec![Form::int(n)])])
         }
         8 => gen_for(ctx, e),
@@ -1663,7 +1704,15 @@ fn distinct_pool_keys(ctx: &mut Ctx, max: usize) -> Vec<Form> {
 fn gen_map_op(ctx: &mut Ctx, v: &ValType) -> Form {
     // Tags: 0 assoc, 1 dissoc, 2 select-keys, 3 merge, 4 zipmap.
     debug_assert!(!ctx.opts.no_maps);
-    match pick_kind(ctx, &[(4, 0), (1, 1), (1, 2), (1, 3), (1, 4)]) {
+    let mut kinds = vec![(4, 0), (1, 1)];
+    // select-keys key lists, the merge key list, and zipmap values are
+    // all vectors.
+    if !ctx.opts.no_vectors {
+        kinds.push((1, 2));
+        kinds.push((1, 3));
+        kinds.push((1, 4));
+    }
+    match pick_kind(ctx, &kinds) {
         1 => nested(ctx, 1, 0, |ctx| {
             let m = gen_expr(ctx, &ValType::Map(Box::new(v.clone())));
             let k = Form::kw(*ctx.rng.pick(&MAP_KEYS));

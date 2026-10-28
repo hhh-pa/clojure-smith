@@ -6,11 +6,14 @@
 //! called function. Violating it makes `swap!` retry forever, because every
 //! attempt changes the atom and fails the compare-and-swap.
 
-use clojure_smith::form::Form;
+use clojure_smith::cost::{WORK_BUDGET_PER_FUNC, acc_growth_cap};
+use clojure_smith::form::{Form, parse_all};
 use clojure_smith::gen_expr::{MAX_CALL_LOOP_TRIPS, MAX_SELF_SITES};
-use clojure_smith::gen_program::gen_program;
+use clojure_smith::gen_program::{emit_program, gen_program};
 use clojure_smith::options::parse_generator_args;
+use clojure_smith::types::MAP_KEYS;
 use std::collections::{HashMap, HashSet};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 fn sym(form: &Form) -> Option<&str> {
     match form {
@@ -768,6 +771,563 @@ fn work_budget_shapes_hold() {
                 }
             }
             assert!(errors.is_empty(), "{args:?} seed {seed}: {errors:?}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Flag suppression matrix: every `--no-*` flag must actually suppress its
+// constructs — and must never panic the generator. Forced-type sites that
+// bypass kind gating (doseq's vector coll under `--no-vectors` panicked
+// with exit 101) are exactly what this catches.
+// ---------------------------------------------------------------------------
+
+/// Banned call heads per suppression flag (checked in user function bodies).
+fn banned_heads(flag: &str) -> &'static [&'static str] {
+    match flag {
+        "--no-vectors" => &[
+            "vec",
+            "vector?",
+            "mapv",
+            "filterv",
+            "doseq",
+            "for",
+            "range",
+            "s-nth",
+            "s-peek",
+            "s-pop",
+            "s-subvec",
+            "s-assoc-v",
+            "s-take",
+            "s-drop",
+            "conj",
+            "interleave",
+            "concat",
+            "sort",
+            "distinct",
+            "vals",
+            "str/split",
+        ],
+        "--no-maps" => &[
+            "dissoc",
+            "select-keys",
+            "merge",
+            "zipmap",
+            "s-get",
+            "vals",
+            "map?",
+        ],
+        "--no-strings" => &[
+            "str",
+            "name",
+            "s-subs",
+            "str/split",
+            "str/join",
+            "str/trim",
+            "str/reverse",
+            "str/blank?",
+            "str/includes?",
+            "str/starts-with?",
+            "str/ends-with?",
+            "string?",
+        ],
+        "--no-doubles" => &["double", "s-div"],
+        "--no-loops" => &["loop", "dotimes", "doseq", "for"],
+        "--no-higher-order" => &["mapv", "filterv", "reduce"],
+        "--no-bitops" => &[
+            "bit-and",
+            "bit-or",
+            "bit-xor",
+            "bit-not",
+            "bit-shift-left",
+            "bit-shift-right",
+            "unsigned-bit-shift-right",
+        ],
+        "--no-divs" => &["quot", "rem", "/", "s-quot", "s-rem", "s-div"],
+        "--no-globals" => &["atom", "swap!", "reset!", "compare-and-set!"],
+        _ => &[],
+    }
+}
+
+/// Walk `form`, flagging vector *values* while exempting binding-vector
+/// syntax (`let`/`loop`/`doseq`/`for`/`dotimes`/`fn` position 1, `defn`
+/// position 2). Binding contents are still scanned: a collection expression
+/// there is a value, so a vector inside one is a violation.
+fn check_no_vector_values(form: &Form, fname: &str, errors: &mut Vec<String>) {
+    match form {
+        Form::Vector(_) => errors.push(format!("{fname}: vector value under --no-vectors")),
+        Form::List(fs) => {
+            let head = fs.first().and_then(sym);
+            for (i, c) in fs.iter().enumerate().skip(1) {
+                let is_binding = matches!(
+                    head,
+                    Some("let" | "loop" | "doseq" | "for" | "dotimes" | "fn")
+                ) && i == 1
+                    || matches!(head, Some("defn")) && i == 2;
+                if is_binding && let Form::Vector(items) = c {
+                    for b in items {
+                        check_no_vector_values(b, fname, errors);
+                    }
+                } else {
+                    check_no_vector_values(c, fname, errors);
+                }
+            }
+        }
+        Form::Map(ps) => {
+            for (k, v) in ps {
+                check_no_vector_values(k, fname, errors);
+                check_no_vector_values(v, fname, errors);
+            }
+        }
+        _ => {
+            for c in form.children() {
+                check_no_vector_values(c, fname, errors);
+            }
+        }
+    }
+}
+
+fn check_flag_suppression(
+    flag: &str,
+    forms: &[Form],
+    bodies: &[(String, Vec<Form>)],
+    errors: &mut Vec<String>,
+) {
+    let banned = banned_heads(flag);
+    for (fname, body) in bodies {
+        let mut stack: Vec<&Form> = body.iter().collect();
+        while let Some(f) = stack.pop() {
+            match f {
+                Form::List(fs)
+                    if fs
+                        .first()
+                        .and_then(sym)
+                        .is_some_and(|h| banned.contains(&h)) =>
+                {
+                    let h = fs.first().and_then(sym).unwrap();
+                    errors.push(format!("{fname}: banned head `{h}` under {flag}"));
+                }
+                Form::List(fs)
+                    if flag == "--no-maps" && fs.first().and_then(sym) == Some("assoc") =>
+                {
+                    // Map assoc uses pooled :k* keys; record assoc uses
+                    // field names, and anything else is fail-closed.
+                    let map_key = matches!(fs.get(2),
+                        Some(Form::Keyword(k)) if MAP_KEYS.contains(&k.as_str()));
+                    let non_key = !matches!(fs.get(2), Some(Form::Keyword(_)));
+                    if map_key || non_key {
+                        errors.push(format!("{fname}: map assoc under --no-maps"));
+                    }
+                }
+                Form::Map(_) if flag == "--no-maps" => {
+                    errors.push(format!("{fname}: map literal under --no-maps"));
+                }
+                Form::Str(_) | Form::Char(_) | Form::Regex(_) if flag == "--no-strings" => {
+                    errors.push(format!("{fname}: string literal under --no-strings"));
+                }
+                Form::Float(_) if flag == "--no-doubles" => {
+                    errors.push(format!("{fname}: double literal under --no-doubles"));
+                }
+                Form::Deref(_) if flag == "--no-globals" => {
+                    errors.push(format!("{fname}: deref under --no-globals"));
+                }
+                _ => {}
+            }
+            stack.extend(f.children());
+        }
+        if flag == "--no-vectors" {
+            for f in body {
+                check_no_vector_values(f, fname, errors);
+            }
+        }
+    }
+    // Top-level forms: record/global definitions live outside bodies.
+    for f in forms {
+        if let Form::List(fs) = f
+            && let Some(head) = fs.first().and_then(sym)
+        {
+            match head {
+                "defrecord" if flag == "--no-records" => {
+                    errors.push("<top>: defrecord under --no-records".to_string())
+                }
+                "def" if flag == "--no-globals" => {
+                    errors.push("<top>: global def under --no-globals".to_string())
+                }
+                "defn" if flag == "--no-records" => {
+                    // Record constructors are `->recN`; plain `->` is the
+                    // threading macro and is fine.
+                    let mut stack = vec![f];
+                    while let Some(g) = stack.pop() {
+                        if let Form::List(gs) = g
+                            && gs.first().and_then(sym).is_some_and(|h| {
+                                h.starts_with("->rec") && h[4..].chars().all(|c| c.is_ascii_digit())
+                            })
+                        {
+                            errors.push("<top>: record ctor under --no-records".to_string());
+                            break;
+                        }
+                        stack.extend(g.children());
+                    }
+                }
+                "defn" if flag == "--no-recursion" => {
+                    if let Some(Form::Vector(params)) = fs.get(2)
+                        && params.first().and_then(sym) == Some("fuel")
+                    {
+                        errors.push("<top>: fuel param under --no-recursion".to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[test]
+fn suppression_matrix() {
+    let flags = [
+        "--no-vectors",
+        "--no-maps",
+        "--no-strings",
+        "--no-doubles",
+        "--no-records",
+        "--no-loops",
+        "--no-recursion",
+        "--no-globals",
+        "--no-higher-order",
+        "--no-bitops",
+        "--no-divs",
+        "--no-safe-math",
+        "--no-checksum",
+    ];
+    let mut configs: Vec<Vec<&str>> = flags.iter().map(|f| vec![*f]).collect();
+    // Kitchen sink: everything off at once must still generate cleanly.
+    configs.push(flags.to_vec());
+    let mut failures = Vec::new();
+    for args in &configs {
+        let opts = parse_generator_args(args.clone()).unwrap();
+        for seed in 0..50 {
+            let prog = match catch_unwind(AssertUnwindSafe(|| gen_program(&opts, seed))) {
+                Ok(p) => p,
+                Err(_) => {
+                    failures.push(format!("{args:?} seed {seed}: generator panicked"));
+                    continue;
+                }
+            };
+            let bodies = user_bodies(&prog.forms);
+            let mut errors = Vec::new();
+            for flag in args.iter() {
+                check_flag_suppression(flag, &prog.forms, &bodies, &mut errors);
+            }
+            for e in errors {
+                failures.push(format!("{args:?} seed {seed}: {e}"));
+            }
+            if failures.len() > 40 {
+                break;
+            }
+        }
+        if failures.len() > 40 {
+            break;
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Heads whose value is definitely a growable collection or string, so a
+/// `loop` update headed by one is subject to the accumulator growth cap.
+/// Type-directed generation guarantees the update's type matches its head;
+/// `if`/`let`/calls and friends are skipped (missed coverage, never a
+/// false positive). Bare `assoc` is handled separately: map assoc uses
+/// pooled `:k*` keys while record assoc (fixed fields, uncapped) uses
+/// field names.
+const GROWABLE_UPDATE_HEADS: &[&str] = &[
+    "vec",
+    "vector",
+    "conj",
+    "interleave",
+    "concat",
+    "merge",
+    "zipmap",
+    "str",
+    "subvec",
+    "s-take",
+    "s-drop",
+    "sort",
+    "distinct",
+    "mapv",
+    "filterv",
+    "select-keys",
+    "dissoc",
+    "s-pop",
+    "s-assoc-v",
+    "vals",
+    "str/split",
+];
+
+/// A `loop` update mentioning a growable accumulator twice or more must
+/// have its trips capped: the memory growth is geometric while the work
+/// budget is linear. Regression test for the seed-496 OOM
+/// (`(vec (interleave acc acc))` with 42 trips under high
+/// `--max-loop-iters`).
+#[test]
+fn loop_acc_growth_is_bounded() {
+    let opt_sets: Vec<Vec<&str>> = vec![
+        vec![],
+        vec!["--max-funcs", "8", "--max-block-size", "8"],
+        vec!["--max-loop-iters", "100000"],
+    ];
+    let mut checked = 0;
+    for args in &opt_sets {
+        let opts = parse_generator_args(args.clone()).unwrap();
+        for seed in 0..150 {
+            let prog = gen_program(&opts, seed);
+            let bodies = user_bodies(&prog.forms);
+            for (name, body) in &bodies {
+                let mut stack: Vec<&Form> = body.iter().collect();
+                while let Some(f) = stack.pop() {
+                    let Form::List(fs) = f else {
+                        stack.extend(f.children());
+                        continue;
+                    };
+                    if sym(&fs[0]) != Some("loop") || fs.len() != 3 {
+                        stack.extend(f.children());
+                        continue;
+                    }
+                    // (loop [i _ acc (identity INIT)] (if (< i N) (recur _ UPDATE) _))
+                    let mut growable = false;
+                    if let Form::Vector(bind) = &fs[1]
+                        && bind.len() == 4
+                        && let Form::List(id) = &bind[3]
+                        && id.len() == 2
+                        && sym(&id[0]) == Some("identity")
+                        && matches!(&id[1], Form::Vector(_) | Form::Map(_) | Form::Str(_))
+                    {
+                        growable = true;
+                    }
+                    if let Form::List(cond) = &fs[2]
+                        && cond.len() == 4
+                        && sym(&cond[0]) == Some("if")
+                        && let Form::List(test) = &cond[1]
+                        && test.len() == 3
+                        && let Form::Int(n) = &test[2]
+                        && let Form::List(recur) = &cond[2]
+                        && recur.len() == 3
+                        && sym(&recur[0]) == Some("recur")
+                    {
+                        let update = &recur[2];
+                        if let Form::List(ufs) = update
+                            && let Some(h) = ufs.first().and_then(sym)
+                        {
+                            if GROWABLE_UPDATE_HEADS.contains(&h) {
+                                growable = true;
+                            }
+                            if h == "assoc"
+                                && matches!(ufs.get(2),
+                                    Some(Form::Keyword(k)) if MAP_KEYS.contains(&k.as_str()))
+                            {
+                                growable = true;
+                            }
+                        }
+                        let refs = update.count_sym("acc");
+                        if growable && refs > 1 {
+                            checked += 1;
+                            let cap = acc_growth_cap(refs);
+                            assert!(
+                                *n <= cap,
+                                "{args:?} seed {seed} {name}: growable acc x{refs} with {n} trips (cap {cap})"
+                            );
+                        }
+                    }
+                    stack.extend(f.children());
+                }
+            }
+        }
+    }
+    assert!(checked > 0, "no multi-ref growable loops observed");
+}
+
+/// Every `(range n)` is shrunk to fit the remaining budget and charged
+/// per element, so `n` never exceeds the per-function budget no matter
+/// how large `--max-loop-iters` draws. Regression test: an 800k range
+/// used to be free, blowing time and memory outside the budget.
+#[test]
+fn range_sizes_fit_budget() {
+    let opt_sets: Vec<Vec<&str>> = vec![vec![], vec!["--max-loop-iters", "1000000"]];
+    let mut checked = 0;
+    for args in &opt_sets {
+        let opts = parse_generator_args(args.clone()).unwrap();
+        for seed in 0..150 {
+            let prog = gen_program(&opts, seed);
+            let mut stack: Vec<&Form> = prog.forms.iter().collect();
+            while let Some(f) = stack.pop() {
+                if let Form::List(fs) = f
+                    && fs.len() == 2
+                    && sym(&fs[0]) == Some("range")
+                    && let Form::Int(n) = &fs[1]
+                {
+                    checked += 1;
+                    assert!(
+                        *n >= 0 && *n <= WORK_BUDGET_PER_FUNC as i64,
+                        "{args:?} seed {seed}: (range {n}) exceeds budget {WORK_BUDGET_PER_FUNC}"
+                    );
+                }
+                stack.extend(f.children());
+            }
+        }
+    }
+    assert!(checked > 0, "no ranges observed");
+}
+
+/// `case` keys must be distinct integers (a duplicate key is a
+/// compile error in Clojure), and every map literal must stay within the
+/// pooled key set at 8 entries so it is an array-map with deterministic
+/// order rather than a hash-map.
+#[test]
+fn case_keys_distinct_and_maps_small() {
+    let opt_sets: Vec<Vec<&str>> = vec![vec![], vec!["--max-funcs", "8", "--max-block-size", "8"]];
+    for args in &opt_sets {
+        let opts = parse_generator_args(args.clone()).unwrap();
+        for seed in 0..150 {
+            let prog = gen_program(&opts, seed);
+            let mut stack: Vec<&Form> = prog.forms.iter().collect();
+            while let Some(f) = stack.pop() {
+                match f {
+                    Form::List(fs) if fs.first().and_then(sym) == Some("case") => {
+                        // (case SCRUTINY K1 V1 ... Kn Vn DEFAULT)
+                        assert!(
+                            fs.len() >= 5 && fs.len() % 2 == 1,
+                            "{args:?} seed {seed}: malformed case"
+                        );
+                        let mut keys = HashSet::new();
+                        let mut i = 2;
+                        while i + 1 < fs.len() {
+                            match &fs[i] {
+                                Form::Int(k) => {
+                                    assert!(
+                                        keys.insert(k),
+                                        "{args:?} seed {seed}: duplicate case key {k}"
+                                    );
+                                }
+                                other => {
+                                    panic!("{args:?} seed {seed}: non-integer case key {other:?}")
+                                }
+                            }
+                            i += 2;
+                        }
+                    }
+                    Form::Map(pairs) => {
+                        assert!(
+                            pairs.len() <= MAP_KEYS.len(),
+                            "{args:?} seed {seed}: map with {} entries",
+                            pairs.len()
+                        );
+                        for (k, _) in pairs {
+                            match k {
+                                Form::Keyword(k) => assert!(
+                                    MAP_KEYS.contains(&k.as_str()),
+                                    "{args:?} seed {seed}: unpooled map key {k:?}"
+                                ),
+                                other => {
+                                    panic!("{args:?} seed {seed}: non-keyword map key {other:?}")
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                stack.extend(f.children());
+            }
+        }
+    }
+}
+
+/// Emitted programs must re-parse to the exact same forms: any
+/// pretty-printer infidelity (bad float/string escaping, dropped nodes)
+/// corrupts every downstream consumer, including `drive` and `reduce`.
+#[test]
+fn emitted_programs_reparse_exactly() {
+    let opt_sets: Vec<Vec<&str>> = vec![
+        vec![],
+        vec!["--max-funcs", "8", "--max-block-size", "8"],
+        vec!["--no-safe-math"],
+        vec!["--no-vectors", "--no-maps", "--no-records"],
+    ];
+    for args in &opt_sets {
+        let opts = parse_generator_args(args.clone()).unwrap();
+        for seed in 0..50 {
+            let prog = gen_program(&opts, seed);
+            let text = emit_program(&prog, &opts);
+            let back = parse_all(&text)
+                .unwrap_or_else(|e| panic!("{args:?} seed {seed}: reparse failed: {e}"));
+            assert_eq!(back, prog.forms, "{args:?} seed {seed}: reparse mismatch");
+        }
+    }
+}
+
+/// Zero maxima must still generate a complete program: no panics on
+/// empty draws (`below(0)`), and the entry point must exist and print
+/// something even with no functions or globals to hash.
+#[test]
+fn zero_options_generate_cleanly() {
+    let zeros = vec![
+        "--max-funcs",
+        "0",
+        "--max-params",
+        "0",
+        "--max-globals",
+        "0",
+        "--max-records",
+        "0",
+        "--max-record-fields",
+        "0",
+        "--max-block-depth",
+        "0",
+        "--max-block-size",
+        "0",
+        "--max-expr-depth",
+        "0",
+        "--max-vector-len",
+        "0",
+        "--max-map-size",
+        "0",
+        "--max-string-len",
+        "0",
+        "--max-loop-iters",
+        "0",
+        "--max-recursion-depth",
+        "0",
+    ];
+    let mut kitchen = zeros.clone();
+    kitchen.extend([
+        "--no-vectors",
+        "--no-maps",
+        "--no-strings",
+        "--no-doubles",
+        "--no-records",
+        "--no-loops",
+        "--no-recursion",
+        "--no-globals",
+        "--no-higher-order",
+        "--no-bitops",
+        "--no-divs",
+    ]);
+    for args in [&zeros[..], &kitchen[..]] {
+        let opts = parse_generator_args(args.to_vec()).unwrap();
+        opts.validate().expect("zero options validate");
+        for seed in 0..30 {
+            let prog = match catch_unwind(AssertUnwindSafe(|| gen_program(&opts, seed))) {
+                Ok(p) => p,
+                Err(_) => panic!("{args:?} seed {seed}: generator panicked"),
+            };
+            assert!(!prog.forms.is_empty(), "{args:?} seed {seed}: no forms");
+            let text = emit_program(&prog, &opts);
+            assert!(
+                text.contains("smith-main"),
+                "{args:?} seed {seed}: no entry point"
+            );
+            assert!(
+                text.contains("checksum:") || text.contains("\"done\""),
+                "{args:?} seed {seed}: entry prints nothing"
+            );
         }
     }
 }

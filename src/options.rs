@@ -53,7 +53,7 @@ pub struct GenerateOptions {
     #[arg(long, default_value_t = 4)]
     pub max_expr_depth: u32,
 
-    /// Maximum length of generated vector literals.
+    /// Maximum length of generated vector literals (at most 1024).
     #[arg(long, default_value_t = 4)]
     pub max_vector_len: u32,
 
@@ -61,7 +61,7 @@ pub struct GenerateOptions {
     #[arg(long, default_value_t = 4)]
     pub max_map_size: u32,
 
-    /// Maximum length of generated string literals.
+    /// Maximum length of generated string literals (at most 4096).
     #[arg(long, default_value_t = 16)]
     pub max_string_len: u32,
 
@@ -101,7 +101,9 @@ pub struct GenerateOptions {
     #[arg(long)]
     pub no_records: bool,
 
-    /// Do not generate loops.
+    /// Do not generate loops (`loop`, `dotimes`, `doseq`, `for`).
+    /// A bare `(range n)` is still allowed: it is inert unrealized data,
+    /// and its realization size is bounded separately (see `gen_vec_op`).
     #[arg(long)]
     pub no_loops: bool,
 
@@ -149,6 +151,21 @@ impl GenerateOptions {
                     .to_string(),
             );
         }
+        // Sizes multiply (a vector literal holds many strings), so these
+        // ceilings are much lower than the generic one below; draws are
+        // clamped to the same bounds for library users who skip validate().
+        if self.max_vector_len > crate::types::MAX_VECTOR_DRAW as u32 {
+            return Err(format!(
+                "--max-vector-len cannot exceed {} (sizes multiply across nesting)",
+                crate::types::MAX_VECTOR_DRAW
+            ));
+        }
+        if self.max_string_len > crate::types::MAX_STRING_DRAW as u32 {
+            return Err(format!(
+                "--max-string-len cannot exceed {} (sizes multiply across nesting)",
+                crate::types::MAX_STRING_DRAW
+            ));
+        }
         for (name, value) in [
             ("--max-funcs", self.max_funcs),
             ("--max-globals", self.max_globals),
@@ -157,8 +174,6 @@ impl GenerateOptions {
             ("--max-block-depth", self.max_block_depth),
             ("--max-block-size", self.max_block_size),
             ("--max-expr-depth", self.max_expr_depth),
-            ("--max-vector-len", self.max_vector_len),
-            ("--max-string-len", self.max_string_len),
             ("--max-loop-iters", self.max_loop_iters),
             ("--max-recursion-depth", self.max_recursion_depth),
         ] {
@@ -292,6 +307,20 @@ mod tests {
         assert_eq!(o.seed, Some(-7));
         assert!(o.no_loops);
         assert!(o.no_safe_math);
+    }
+
+    #[test]
+    fn ceilings_reject_multiplicative_sizes() {
+        let mut o = defaults();
+        o.max_string_len = crate::types::MAX_STRING_DRAW as u32 + 1;
+        assert!(o.validate().is_err());
+        let mut o = defaults();
+        o.max_vector_len = crate::types::MAX_VECTOR_DRAW as u32 + 1;
+        assert!(o.validate().is_err());
+        let mut o = defaults();
+        o.max_string_len = crate::types::MAX_STRING_DRAW as u32;
+        o.max_vector_len = crate::types::MAX_VECTOR_DRAW as u32;
+        o.validate().expect("ceilings themselves validate");
     }
 
     #[test]

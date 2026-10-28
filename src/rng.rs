@@ -28,13 +28,6 @@ impl Rng {
         }
     }
 
-    /// Create an independent child RNG derived from this one. Drawing from
-    /// the child does not disturb this sequence beyond the single draw used
-    /// to seed the child.
-    pub fn fork(&mut self) -> Self {
-        Self::new(self.next_u64())
-    }
-
     /// A uniformly random 64-bit value.
     pub fn next_u64(&mut self) -> u64 {
         self.inner.next_u64()
@@ -50,16 +43,18 @@ impl Rng {
         self.next_u64() & 1 == 1
     }
 
-    /// Uniform value in `[0, n)`. Panics when `n == 0`.
+    /// Uniform value in `[0, n)` via Lemire's multiplication method
+    /// (same as [`Rng::range`]: no modulo bias). Panics when `n == 0`.
     pub fn below(&mut self, n: usize) -> usize {
         assert!(n > 0, "below: empty range");
-        (self.next_u64() % n as u64) as usize
+        ((self.next_u64() as u128 * n as u128) >> 64) as usize
     }
 
-    /// Uniform value in `[0, n)`. Panics when `n == 0`.
+    /// Uniform value in `[0, n)` via Lemire's multiplication method.
+    /// Panics when `n == 0`.
     pub fn below_u64(&mut self, n: u64) -> u64 {
         assert!(n > 0, "below_u64: empty range");
-        self.next_u64() % n
+        ((self.next_u64() as u128 * n as u128) >> 64) as u64
     }
 
     /// Uniform value in `[lo, hi]` inclusive. Panics when `lo > hi`.
@@ -83,12 +78,15 @@ impl Rng {
     }
 
     /// True with probability `p`, which must lie in `[0.0, 1.0]`.
+    /// The comparison is exact at the endpoints (`chance(0.0)` never and
+    /// `chance(1.0)` always fires); in between, the threshold `p * 2^64`
+    /// carries at most one ulp of error and the draw itself is unrounded.
     pub fn chance(&mut self, p: f64) -> bool {
         debug_assert!(
             (0.0..=1.0).contains(&p),
             "chance: probability out of range: {p}"
         );
-        (self.next_u64() as f64) < p * (u64::MAX as f64)
+        (self.next_u64() as u128) < (p * 18446744073709551616.0) as u128
     }
 
     /// Uniform random element of a non-empty slice.
@@ -192,14 +190,73 @@ mod tests {
     }
 
     #[test]
-    fn fork_is_independent_and_deterministic() {
-        let mut a = Rng::new(11);
-        let mut a_child = a.fork();
-        let mut b = Rng::new(11);
-        let mut b_child = b.fork();
-        for _ in 0..100 {
-            assert_eq!(a.next_u64(), b.next_u64());
-            assert_eq!(a_child.next_u64(), b_child.next_u64());
+    fn golden_stream() {
+        // Pins the exact stream: any accidental algorithm change (a
+        // dependency update, a reverted Lemire mapping) fails loudly
+        // instead of silently reshuffling every generated program.
+        let mut rng = Rng::new(20261028);
+        let words: Vec<u64> = (0..8).map(|_| rng.next_u64()).collect();
+        assert_eq!(
+            words,
+            [
+                9677812423993567097,
+                6855976299915113729,
+                8006572139590848333,
+                7762274101859100948,
+                2803034124250071575,
+                10213342649516505979,
+                7230576563002253606,
+                13780324159715158825,
+            ]
+        );
+        let mut rng = Rng::new(20261028);
+        let draws: Vec<usize> = (0..8).map(|_| rng.below(1000)).collect();
+        assert_eq!(draws, [524, 371, 434, 420, 151, 553, 391, 747]);
+        let mut rng = Rng::new(20261028);
+        let chances: Vec<bool> = (0..16).map(|_| rng.chance(0.5)).collect();
+        assert_eq!(
+            chances,
+            [
+                false, true, true, true, true, false, true, false, true, false, false, true, true,
+                true, false, true,
+            ]
+        );
+    }
+
+    #[test]
+    fn edges() {
+        let mut rng = Rng::new(5);
+        assert_eq!(rng.below(1), 0);
+        assert_eq!(rng.below_u64(1), 0);
+        assert_eq!(rng.range(7, 7), 7);
+        assert_eq!(rng.range_usize(3, 3), 3);
+        for _ in 0..1000 {
+            assert!(!rng.chance(0.0));
+            assert!(rng.chance(1.0));
         }
+        assert_eq!(*rng.pick(&[42]), 42);
+        assert_eq!(rng.pick_index_weighted(&[7]), 0);
+        // Degenerate inputs panic rather than wrap or hang.
+        let caught = |f: &mut dyn FnMut()| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err()
+        };
+        assert!(caught(&mut || {
+            Rng::new(5).below(0);
+        }));
+        assert!(caught(&mut || {
+            Rng::new(5).below_u64(0);
+        }));
+        assert!(caught(&mut || {
+            Rng::new(5).range(2, 1);
+        }));
+        assert!(caught(&mut || {
+            Rng::new(5).pick::<u8>(&[]);
+        }));
+        assert!(caught(&mut || {
+            Rng::new(5).pick_index_weighted(&[]);
+        }));
+        assert!(caught(&mut || {
+            Rng::new(5).pick_index_weighted(&[0, 0]);
+        }));
     }
 }

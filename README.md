@@ -10,7 +10,7 @@ output divergence.
 
 ```bash
 clojure-smith --seed 42 -o prog.clj   # generate
-clojure -M prog.clj                   # checksum: -3813667259982852713
+clojure -M prog.clj                   # checksum: -2138858171925291515
 ```
 
 ## Relationship to Csmith
@@ -91,9 +91,9 @@ clojure-smith [OPTIONS]
 | `--max-block-depth N` | 3 | max control-form nesting |
 | `--max-block-size N` | 4 | max statements per body |
 | `--max-expr-depth N` | 4 | max expression nesting |
-| `--max-vector-len N` | 4 | max vector literal length |
+| `--max-vector-len N` | 4 | max vector literal length (≤ 1024) |
 | `--max-map-size N` | 4 | max map size (≤ 8, see below) |
-| `--max-string-len N` | 16 | max string literal length |
+| `--max-string-len N` | 16 | max string literal length (≤ 4096) |
 | `--max-loop-iters N` | 16 | max loop trip count |
 | `--max-recursion-depth N` | 8 | max recursion fuel |
 | `--no-bitops` | off | no bitwise operations |
@@ -103,7 +103,7 @@ clojure-smith [OPTIONS]
 | `--no-maps` | off | no maps |
 | `--no-strings` | off | no strings |
 | `--no-records` | off | no records |
-| `--no-loops` | off | no loops |
+| `--no-loops` | off | no `loop`/`dotimes`/`doseq`/`for` (bare `(range n)` is inert data) |
 | `--no-recursion` | off | no recursive functions |
 | `--no-globals` | off | no global state |
 | `--no-higher-order` | off | no mapv/filterv/reduce |
@@ -132,6 +132,8 @@ another JDK, or extra `-J` flags. A seed is `OK` when every runner exits 0
 with byte-identical stdout, `MISMATCH` when outputs differ, and `ERROR` when
 any runner fails or times out (`--timeout`, default 120s). Failures are saved
 to `--fail-dir/seed-N/` with the program and each runner's outputs.
+Exit codes: 0 when every seed agrees, 1 when any divergence was found,
+2 for bad usage, 3 when seeds failed without any clean comparison.
 
 Any `threw:` line under default options indicates a generator bug — please
 report it with the seed.
@@ -143,9 +145,10 @@ clojure-smith reduce --test "./interesting.sh {}" prog.clj -o small.clj
 ```
 
 The test command must exit 0 while the case is still interesting (e.g. still
-diverges, still throws, still hangs — compose with `timeout(1)` for hangs).
-The reducer alternatingly delta-minimizes top-level forms and replaces
-subforms with constants until fixpoint or `--tries` (default 10000). It
+diverges, still throws). For hangs, pass `--timeout-is-interesting` with a
+short `--timeout` so timeouts count as interesting. The reducer alternatingly
+delta-minimizes top-level forms, replaces subforms with constants, and drops
+list wrappers (`(f X)` to `X`) until fixpoint or `--tries` (default 10000). It
 understands the plain-Clojure syntax the generator emits; exotic reader
 features (syntax-quote, tagged literals, `#()` fns, ratios, bigints) are
 rejected with a clear error.

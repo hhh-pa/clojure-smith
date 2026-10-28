@@ -104,6 +104,18 @@ impl Form {
         }
     }
 
+    /// Count free-or-bound occurrences of the symbol `name` in this form.
+    /// Shadowing is ignored (a nested `loop` also binds `acc`): the count
+    /// over-approximates, which is the safe direction for growth guards.
+    pub fn count_sym(&self, name: &str) -> usize {
+        let here = matches!(self, Form::Symbol(s) if s == name) as usize;
+        here + self
+            .children()
+            .iter()
+            .map(|c| c.count_sym(name))
+            .sum::<usize>()
+    }
+
     /// Immediate child forms (empty for atoms).
     pub fn children(&self) -> Vec<&Form> {
         match self {
@@ -962,5 +974,16 @@ mod tests {
         );
         // Pretty output must re-parse to the same form.
         assert_eq!(parse_one(&pretty).unwrap(), long);
+    }
+
+    #[test]
+    fn count_sym_counts_nested_occurrences() {
+        let f = parse_one("(vec (interleave acc acc))").unwrap();
+        assert_eq!(f.count_sym("acc"), 2);
+        assert_eq!(f.count_sym("vec"), 1);
+        assert_eq!(f.count_sym("nope"), 0);
+        // Binding positions count too (conservative for growth guards).
+        let b = parse_one("(loop [i 0 acc 0] acc)").unwrap();
+        assert_eq!(b.count_sym("acc"), 2);
     }
 }
