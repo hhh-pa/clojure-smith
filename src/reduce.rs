@@ -570,6 +570,8 @@ pub fn run_reduce(opts: &ReduceOptions) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the unix-gated shell tests below need it.
+    #[cfg(unix)]
     use crate::driver::unique_tag;
     use crate::form::parse_one;
 
