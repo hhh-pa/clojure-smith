@@ -1,0 +1,14 @@
+[package]
+name = "clojure-smith"
+version = "0.1.0"
+edition = "2024"
+description = "A random generator of Clojure programs, for differential testing of Clojure compilers"
+license = "EPL-1.0"
+repository = "https://github.com/hhh-pa/clojure-smith"
+readme = "README.md"
+keywords = ["clojure", "fuzzing", "testing", "compiler", "differential-testing"]
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+rand = "0.10.3"
+rand_chacha = "0.10.0"
