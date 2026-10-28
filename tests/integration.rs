@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use clojure_smith::driver::unique_tag;
 
@@ -29,7 +30,25 @@ fn tmpdir(name: &str) -> PathBuf {
     d
 }
 
+static JVM_WARM: OnceLock<()> = OnceLock::new();
+
+/// Warm the Clojure dependency cache exactly once, serially, before any
+/// test spawns JVMs. Concurrent cold-cache `clojure` invocations race
+/// populating the local cache and losers die with "Could not find or
+/// load main class clojure.main" (exit 1, empty stdout) — the failure
+/// this guards. `OnceLock` blocks latecomers until warm-up finishes.
+fn jvm_warmed() {
+    JVM_WARM.get_or_init(|| {
+        let status = Command::new("clojure")
+            .args(["-M", "-e", "(println :warm)"])
+            .status()
+            .expect("spawn clojure warm-up");
+        assert!(status.success(), "clojure warm-up failed: {status}");
+    });
+}
+
 fn run_clojure(file: &Path) -> (bool, String) {
+    jvm_warmed();
     let out = Command::new("clojure")
         .arg("-M")
         .arg(file)
@@ -276,6 +295,36 @@ fn suppressed_programs_run() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Dump a drive run's saved per-seed reports (program, runner stdouts,
+/// stderrs, statuses) into test-failure output. The drive summary alone
+/// says only "exit 1"; without this, CI failures are undiagnosable.
+fn drive_evidence(dir: &Path) -> String {
+    let mut evidence = String::new();
+    let mut seeds: Vec<PathBuf> = std::fs::read_dir(dir.join("failures"))
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok().map(|x| x.path()))
+        .collect();
+    seeds.sort();
+    for seed_dir in seeds.iter().take(4) {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(seed_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok().map(|x| x.path()))
+            .collect();
+        files.sort();
+        for f in files {
+            let raw = std::fs::read(&f).unwrap_or_default();
+            let shown: String = String::from_utf8_lossy(&raw).chars().take(3000).collect();
+            evidence.push_str(&format!("\n--- {} ---\n{shown}", f.display()));
+            if evidence.len() > 20000 {
+                return evidence;
+            }
+        }
+    }
+    evidence
+}
+
 #[test]
 fn drive_no_checksum_runs_and_warns() {
     if !clojure_available() {
@@ -283,6 +332,8 @@ fn drive_no_checksum_runs_and_warns() {
         return;
     }
     let dir = tmpdir("drive-nc");
+    // The drive subprocess spawns JVMs; warm the cache first.
+    jvm_warmed();
     let out = Command::new(binary())
         .args([
             "drive",
@@ -297,7 +348,9 @@ fn drive_no_checksum_runs_and_warns() {
         .args(["--", "--no-checksum"])
         .output()
         .expect("spawn drive");
-    assert!(out.status.success(), "drive failed: {out:?}");
+    if !out.status.success() {
+        panic!("drive failed: {out:?}\n{}", drive_evidence(&dir));
+    }
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         err.contains("disables the differential oracle"),

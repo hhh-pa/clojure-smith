@@ -59,6 +59,14 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   regex escapes, and `#!` shebang lines, with clearer error messages.
 - `Rng::range_usize` covers the full span and `pick_index_weighted`
   cannot overflow on huge weights.
+- Fixed an integration-test flake on cold machines: concurrent
+  first-run `clojure` invocations race populating the dependency cache
+  and losers die with `ClassNotFoundException: clojure.main`. The
+  suite now warms the cache once, serially, before spawning JVMs.
+- The reduce test module's `unique_tag` import is unix-gated (Windows
+  CI tripped `-D warnings` on it).
+- Drive-test failures now dump the saved per-runner outputs into the
+  test log instead of reporting only "exit 1".
 
 ### Added
 

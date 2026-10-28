@@ -128,7 +128,10 @@ under test; the default pair is:
 
 Useful additions: another Clojure version
 (`clojure -Sdeps '{:deps {org.clojure/clojure {:mvn/version "1.11.1"}}}' -M {}`),
-another JDK, or extra `-J` flags. A seed is `OK` when every runner exits 0
+another JDK, or extra `-J` flags. On a machine whose Clojure dependency
+cache is cold, run one program serially first: concurrent cold `clojure`
+invocations race populating the cache and losers fail with
+`ClassNotFoundException: clojure.main`. A seed is `OK` when every runner exits 0
 with byte-identical stdout, `MISMATCH` when outputs differ, and `ERROR` when
 any runner fails or times out (`--timeout`, default 120s). Failures are saved
 to `--fail-dir/seed-N/` with the program and each runner's outputs.
